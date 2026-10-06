@@ -7,9 +7,10 @@ import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ChatMemberStatus
+from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
@@ -25,9 +26,6 @@ from aiogram.types import (
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-# Не вставляй сюда старый токен.
-# Задай новый токен через переменную окружения BOT_TOKEN.
 
 BOT_ADMINS = {
     6977407005,
@@ -49,11 +47,16 @@ RULES_URL = "https://t.me/stardewrus_chat/1255258"
 
 DB_NAME = "stardew_bot.sqlite3"
 
+# Часовой пояс для команд вида:
+# /mut причина 07.10.2026 09:00
+LOCAL_TIMEZONE = ZoneInfo("Europe/Amsterdam")
+
 if not BOT_TOKEN:
     raise RuntimeError(
         "Не найден BOT_TOKEN. "
-        "Установи токен бота в переменную окружения BOT_TOKEN."
+        "Добавь новый токен бота в переменную окружения BOT_TOKEN."
     )
+
 
 # =========================================================
 # LOGGING
@@ -61,10 +64,11 @@ if not BOT_TOKEN:
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 logger = logging.getLogger(__name__)
+
 
 # =========================================================
 # BOT
@@ -73,16 +77,18 @@ logger = logging.getLogger(__name__)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
+
 # =========================================================
 # DATABASE
 # =========================================================
 
 db = sqlite3.connect(
     DB_NAME,
-    check_same_thread=False
+    check_same_thread=False,
 )
 
 db.row_factory = sqlite3.Row
+
 
 db.execute("""
 CREATE TABLE IF NOT EXISTS settings (
@@ -92,6 +98,7 @@ CREATE TABLE IF NOT EXISTS settings (
 )
 """)
 
+
 db.execute("""
 CREATE TABLE IF NOT EXISTS blacklist (
     chat_id INTEGER NOT NULL,
@@ -99,6 +106,7 @@ CREATE TABLE IF NOT EXISTS blacklist (
     PRIMARY KEY(chat_id, word)
 )
 """)
+
 
 db.execute("""
 CREATE TABLE IF NOT EXISTS captchas (
@@ -112,6 +120,7 @@ CREATE TABLE IF NOT EXISTS captchas (
 )
 """)
 
+
 db.execute("""
 CREATE TABLE IF NOT EXISTS welcome_messages (
     chat_id INTEGER NOT NULL,
@@ -119,6 +128,7 @@ CREATE TABLE IF NOT EXISTS welcome_messages (
     PRIMARY KEY(chat_id, message_id)
 )
 """)
+
 
 db.execute("""
 CREATE TABLE IF NOT EXISTS statistics (
@@ -133,6 +143,7 @@ CREATE TABLE IF NOT EXISTS statistics (
 
 db.commit()
 
+
 # =========================================================
 # СОСТОЯНИЯ
 # =========================================================
@@ -140,17 +151,20 @@ db.commit()
 welcome_queue = {}
 welcome_tasks = {}
 
-# Состояние админов
+# Для каждого администратора:
+#
 # {
-#   "chat_id": ...,
-#   "message_id": ...,
-#   "action": ...
+#     "private_chat_id": ID личного чата,
+#     "message_id": ID сообщения панели,
+#     "selected_group": ID выбранной группы,
+#     "action": ...
 # }
+#
 admin_states = {}
 
 
 # =========================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ОБЩИЕ ФУНКЦИИ
 # =========================================================
 
 def is_bot_admin(user_id: int) -> bool:
@@ -171,7 +185,7 @@ def group_title(chat_id: int) -> str:
 
 
 def escape_text(text: str) -> str:
-    return html.escape(text or "")
+    return html.escape(str(text or ""))
 
 
 def mention(user) -> str:
@@ -200,11 +214,14 @@ async def safe_delete(message):
         pass
 
 
-async def is_group_admin(chat_id: int, user_id: int) -> bool:
+async def is_group_admin(
+    chat_id: int,
+    user_id: int,
+) -> bool:
     try:
         member = await bot.get_chat_member(
             chat_id,
-            user_id
+            user_id,
         )
 
         return member.status in {
@@ -224,7 +241,7 @@ def ensure_chat_settings(chat_id: int):
         (chat_id, readonly, captcha_enabled)
         VALUES (?, 0, 1)
         """,
-        (chat_id,)
+        (chat_id,),
     )
 
     db.execute(
@@ -233,7 +250,7 @@ def ensure_chat_settings(chat_id: int):
         (chat_id, joins, messages_deleted, mutes, bans, kicks)
         VALUES (?, 0, 0, 0, 0, 0)
         """,
-        (chat_id,)
+        (chat_id,),
     )
 
     db.commit()
@@ -242,8 +259,15 @@ def ensure_chat_settings(chat_id: int):
 def get_setting(
     chat_id: int,
     setting: str,
-    default=0
+    default=0,
 ):
+    allowed = {
+        "readonly",
+        "captcha_enabled",
+    }
+
+    if setting not in allowed:
+        return default
 
     ensure_chat_settings(chat_id)
 
@@ -253,7 +277,7 @@ def get_setting(
         FROM settings
         WHERE chat_id = ?
         """,
-        (chat_id,)
+        (chat_id,),
     ).fetchone()
 
     if not row:
@@ -265,8 +289,15 @@ def get_setting(
 def set_setting(
     chat_id: int,
     setting: str,
-    value
+    value,
 ):
+    allowed = {
+        "readonly",
+        "captcha_enabled",
+    }
+
+    if setting not in allowed:
+        return
 
     ensure_chat_settings(chat_id)
 
@@ -278,8 +309,8 @@ def set_setting(
         """,
         (
             value,
-            chat_id
-        )
+            chat_id,
+        ),
     )
 
     db.commit()
@@ -287,8 +318,18 @@ def set_setting(
 
 def increment_stat(
     chat_id: int,
-    field: str
+    field: str,
 ):
+    allowed = {
+        "joins",
+        "messages_deleted",
+        "mutes",
+        "bans",
+        "kicks",
+    }
+
+    if field not in allowed:
+        return
 
     ensure_chat_settings(chat_id)
 
@@ -298,14 +339,13 @@ def increment_stat(
         SET {field} = {field} + 1
         WHERE chat_id = ?
         """,
-        (chat_id,)
+        (chat_id,),
     )
 
     db.commit()
 
 
-def get_stats(chat_id):
-
+def get_stats(chat_id: int):
     ensure_chat_settings(chat_id)
 
     row = db.execute(
@@ -314,27 +354,26 @@ def get_stats(chat_id):
         FROM statistics
         WHERE chat_id = ?
         """,
-        (chat_id,)
+        (chat_id,),
     ).fetchone()
 
     return dict(row)
 
 
 # =========================================================
-# КНОПКА УДАЛЕНИЯ СООБЩЕНИЯ БОТА
+# КНОПКА ×
 # =========================================================
 
 def delete_button():
     return InlineKeyboardButton(
         text="×",
-        callback_data="bot_delete"
+        callback_data="bot_delete",
     )
 
 
 def add_delete_button(
-    keyboard=None
+    keyboard=None,
 ):
-
     rows = []
 
     if keyboard:
@@ -355,9 +394,8 @@ def add_delete_button(
 async def send_bot_message(
     chat_id,
     text,
-    reply_markup=None
+    reply_markup=None,
 ):
-
     return await bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -365,7 +403,7 @@ async def send_bot_message(
         disable_web_page_preview=True,
         reply_markup=add_delete_button(
             reply_markup
-        )
+        ),
     )
 
 
@@ -373,11 +411,8 @@ async def send_bot_message(
     F.data == "bot_delete"
 )
 async def bot_delete_callback(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
-    # Для обычного пользователя —
-    # вообще никакой реакции.
     if not is_bot_admin(
         callback.from_user.id
     ):
@@ -398,13 +433,14 @@ def create_captcha():
     a = random.randint(1, 9)
     b = random.randint(1, 9)
 
-    if random.choice([True, False]):
-
+    if random.choice([
+        True,
+        False,
+    ]):
         question = f"{a} + {b}"
         answer = a + b
 
     else:
-
         if b > a:
             a, b = b, a
 
@@ -414,11 +450,7 @@ def create_captcha():
     options = {answer}
 
     while len(options) < 4:
-
-        value = answer + random.randint(
-            -5,
-            5
-        )
+        value = answer + random.randint(-5, 5)
 
         if value >= 0:
             options.add(value)
@@ -430,7 +462,7 @@ def create_captcha():
     return (
         question,
         answer,
-        options
+        options,
     )
 
 
@@ -445,7 +477,7 @@ def text_to_options(text):
     return [
         int(x)
         for x in text.split(",")
-        if x
+        if x.strip()
     ]
 
 
@@ -456,16 +488,17 @@ def captcha_keyboard(rows):
     for row in rows:
 
         user_id = row["user_id"]
+
         options = text_to_options(
             row["options"]
         )
 
         keyboard.append([
             InlineKeyboardButton(
-                text="🔐 Капча пользователя",
+                text=f"👤 {user_id}",
                 callback_data=(
                     f"captcha_info:{user_id}"
-                )
+                ),
             )
         ])
 
@@ -474,14 +507,14 @@ def captcha_keyboard(rows):
                 text=str(options[0]),
                 callback_data=(
                     f"captcha:{user_id}:{options[0]}"
-                )
+                ),
             ),
             InlineKeyboardButton(
                 text=str(options[1]),
                 callback_data=(
                     f"captcha:{user_id}:{options[1]}"
-                )
-            )
+                ),
+            ),
         ])
 
         keyboard.append([
@@ -489,14 +522,14 @@ def captcha_keyboard(rows):
                 text=str(options[2]),
                 callback_data=(
                     f"captcha:{user_id}:{options[2]}"
-                )
+                ),
             ),
             InlineKeyboardButton(
                 text=str(options[3]),
                 callback_data=(
                     f"captcha:{user_id}:{options[3]}"
-                )
-            )
+                ),
+            ),
         ])
 
     return InlineKeyboardMarkup(
@@ -504,8 +537,9 @@ def captcha_keyboard(rows):
     )
 
 
-async def build_captcha_message(chat_id):
-
+async def build_captcha_message(
+    chat_id,
+):
     rows = db.execute(
         """
         SELECT *
@@ -513,7 +547,7 @@ async def build_captcha_message(chat_id):
         WHERE chat_id = ?
         ORDER BY created_at
         """,
-        (chat_id,)
+        (chat_id,),
     ).fetchall()
 
     if not rows:
@@ -528,10 +562,9 @@ async def build_captcha_message(chat_id):
     for row in rows:
 
         try:
-
             member = await bot.get_chat_member(
                 chat_id,
-                row["user_id"]
+                row["user_id"],
             )
 
             user = member.user
@@ -541,7 +574,6 @@ async def build_captcha_message(chat_id):
             )
 
         except Exception:
-
             text += "👤 Пользователь\n"
 
         text += (
@@ -556,32 +588,28 @@ async def build_captcha_message(chat_id):
 
     return (
         text,
-        captcha_keyboard(rows)
+        captcha_keyboard(rows),
     )
 
 
 async def delete_welcome_messages(
-    chat_id
+    chat_id,
 ):
-
     rows = db.execute(
         """
         SELECT message_id
         FROM welcome_messages
         WHERE chat_id = ?
         """,
-        (chat_id,)
+        (chat_id,),
     ).fetchall()
 
     for row in rows:
-
         try:
-
             await bot.delete_message(
                 chat_id,
-                row["message_id"]
+                row["message_id"],
             )
-
         except Exception:
             pass
 
@@ -590,103 +618,114 @@ async def delete_welcome_messages(
         DELETE FROM welcome_messages
         WHERE chat_id = ?
         """,
-        (chat_id,)
+        (chat_id,),
     )
 
     db.commit()
 
 
 async def send_welcome_batch(
-    chat_id
+    chat_id,
 ):
+    try:
+        await asyncio.sleep(1.5)
 
-    await asyncio.sleep(1.5)
+        users = welcome_queue.pop(
+            chat_id,
+            [],
+        )
 
-    users = welcome_queue.pop(
-        chat_id,
-        []
-    )
+        if not users:
+            return
 
-    if not users:
-        return
+        for user in users:
 
-    for user in users:
-
-        question, answer, options = create_captcha()
-
-        db.execute(
-            """
-            INSERT OR REPLACE INTO captchas
-            (
-                chat_id,
-                user_id,
-                question,
-                answer,
-                options,
-                created_at
+            question, answer, options = (
+                create_captcha()
             )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                chat_id,
-                user.id,
-                question,
-                answer,
-                options_to_text(options),
-                int(time.time())
+
+            db.execute(
+                """
+                INSERT OR REPLACE INTO captchas
+                (
+                    chat_id,
+                    user_id,
+                    question,
+                    answer,
+                    options,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chat_id,
+                    user.id,
+                    question,
+                    answer,
+                    options_to_text(options),
+                    int(time.time()),
+                ),
+            )
+
+        db.commit()
+
+        text, keyboard = (
+            await build_captcha_message(
+                chat_id
             )
         )
 
-    db.commit()
-
-    text, keyboard = await build_captcha_message(
-        chat_id
-    )
-
-    if not text:
-        return
-
-    try:
+        if not text:
+            return
 
         message = await send_bot_message(
             chat_id,
             text,
-            keyboard
+            keyboard,
         )
 
-    except Exception as e:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO welcome_messages
+            (chat_id, message_id)
+            VALUES (?, ?)
+            """,
+            (
+                chat_id,
+                message.message_id,
+            ),
+        )
 
+        db.commit()
+
+    except asyncio.CancelledError:
+        return
+
+    except Exception as e:
         logger.exception(
             f"CAPTCHA error: {e}"
         )
-        return
 
-    db.execute(
-        """
-        INSERT OR IGNORE INTO welcome_messages
-        (chat_id, message_id)
-        VALUES (?, ?)
-        """,
-        (
+    finally:
+        welcome_tasks.pop(
             chat_id,
-            message.message_id
+            None,
         )
-    )
-
-    db.commit()
 
 
 async def queue_welcome(
     chat_id,
-    user
+    user,
 ):
-
     if chat_id not in welcome_queue:
         welcome_queue[chat_id] = []
 
-    welcome_queue[chat_id].append(
-        user
-    )
+    # Не добавляем одного пользователя дважды.
+    if not any(
+        existing.id == user.id
+        for existing in welcome_queue[chat_id]
+    ):
+        welcome_queue[chat_id].append(user)
 
     old_task = welcome_tasks.get(
         chat_id
@@ -708,56 +747,36 @@ async def queue_welcome(
 
 @dp.chat_join_request()
 async def join_request_handler(
-    request: ChatJoinRequest
+    request: ChatJoinRequest,
 ):
-
     chat_id = request.chat.id
 
     if not is_managed_group(chat_id):
         return
 
+    user_id = request.from_user.id
+
     try:
 
         await request.approve()
 
-        # Сначала запрещаем писать.
-        await bot.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=request.from_user.id,
-            permissions=ChatPermissions(
-                can_send_messages=False,
-                can_send_audios=False,
-                can_send_documents=False,
-                can_send_photos=False,
-                can_send_videos=False,
-                can_send_video_notes=False,
-                can_send_voice_notes=False,
-                can_send_polls=False,
-                can_send_other_messages=False,
-                can_add_web_page_previews=False,
-            )
-        )
-
         increment_stat(
             chat_id,
-            "joins"
+            "joins",
         )
 
-        if get_setting(
+        captcha_enabled = get_setting(
             chat_id,
             "captcha_enabled",
-            1
-        ):
-            await queue_welcome(
-                chat_id,
-                request.from_user
-            )
+            1,
+        )
 
-        else:
+        # CAPTCHA выключена — сразу разрешаем писать.
+        if not captcha_enabled:
 
             await bot.restrict_chat_member(
                 chat_id=chat_id,
-                user_id=request.from_user.id,
+                user_id=user_id,
                 permissions=ChatPermissions(
                     can_send_messages=True,
                     can_send_audios=True,
@@ -769,80 +788,96 @@ async def join_request_handler(
                     can_send_polls=True,
                     can_send_other_messages=True,
                     can_add_web_page_previews=True,
-                )
+                ),
             )
 
-    except Exception as e:
+            return
 
+        # CAPTCHA включена — сначала полностью ограничиваем.
+        await bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            permissions=ChatPermissions(
+                can_send_messages=False,
+                can_send_audios=False,
+                can_send_documents=False,
+                can_send_photos=False,
+                can_send_videos=False,
+                can_send_video_notes=False,
+                can_send_voice_notes=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+            ),
+        )
+
+        await queue_welcome(
+            chat_id,
+            request.from_user,
+        )
+
+    except Exception as e:
         logger.exception(
             f"Join request error: {e}"
         )
 
 
 # =========================================================
-# CAPTCHA CALLBACK
+# CAPTCHA INFO
 # =========================================================
 
 @dp.callback_query(
     F.data.startswith("captcha_info:")
 )
 async def captcha_info_handler(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     try:
-
         user_id = int(
             callback.data.split(":")[1]
         )
-
     except Exception:
         return
 
     if callback.from_user.id != user_id:
         await callback.answer(
             "Это не твоя капча.",
-            show_alert=True
+            show_alert=True,
         )
         return
 
     await callback.answer(
         "Выбери правильный ответ.",
-        show_alert=True
+        show_alert=True,
     )
 
+
+# =========================================================
+# CAPTCHA ANSWER
+# =========================================================
 
 @dp.callback_query(
     F.data.startswith("captcha:")
 )
 async def captcha_handler(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     try:
-
         _, user_id_text, answer_text = (
             callback.data.split(":")
         )
 
-        user_id = int(
-            user_id_text
-        )
-
-        selected = int(
-            answer_text
-        )
+        user_id = int(user_id_text)
+        selected = int(answer_text)
 
     except Exception:
         return
 
     if callback.from_user.id != user_id:
-
         await callback.answer(
             "Это не твоя капча.",
-            show_alert=True
+            show_alert=True,
         )
-
         return
 
     chat_id = callback.message.chat.id
@@ -856,25 +891,21 @@ async def captcha_handler(
         """,
         (
             chat_id,
-            user_id
-        )
+            user_id,
+        ),
     ).fetchone()
 
     if not row:
-
         await callback.answer(
             "Капча уже пройдена."
         )
-
         return
 
     if selected != row["answer"]:
-
         await callback.answer(
             "Неверный ответ.",
-            show_alert=True
+            show_alert=True,
         )
-
         return
 
     db.execute(
@@ -885,14 +916,13 @@ async def captcha_handler(
         """,
         (
             chat_id,
-            user_id
-        )
+            user_id,
+        ),
     )
 
     db.commit()
 
     try:
-
         await bot.restrict_chat_member(
             chat_id=chat_id,
             user_id=user_id,
@@ -907,11 +937,10 @@ async def captcha_handler(
                 can_send_polls=True,
                 can_send_other_messages=True,
                 can_add_web_page_previews=True,
-            )
+            ),
         )
 
     except Exception as e:
-
         logger.error(
             f"Captcha unrestrict error: {e}"
         )
@@ -922,7 +951,7 @@ async def captcha_handler(
         FROM captchas
         WHERE chat_id = ?
         """,
-        (chat_id,)
+        (chat_id,),
     ).fetchone()[0]
 
     if remaining == 0:
@@ -939,19 +968,19 @@ async def captcha_handler(
             )
         )
 
-        try:
+        if text:
 
-            await callback.message.edit_text(
-                text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=add_delete_button(
-                    keyboard
+            try:
+                await callback.message.edit_text(
+                    text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=add_delete_button(
+                        keyboard
+                    ),
                 )
-            )
-
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     await callback.answer(
         "Капча пройдена!"
@@ -959,33 +988,37 @@ async def captcha_handler(
 
 
 # =========================================================
-# READ ONLY + BLACKLIST
+# ФИЛЬТР ОБЫЧНЫХ СООБЩЕНИЙ
+# =========================================================
+#
+# ВАЖНО:
+# Здесь специально НЕТ обработки команд.
+# Поэтому /mut, /ban, /kick и остальные
+# спокойно доходят до своих handlers.
 # =========================================================
 
 @dp.message(
     F.chat.type.in_({
-        "group",
-        "supergroup"
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
     })
+    & ~F.text.startswith("/")
 )
 async def group_message_filter(
-    message: Message
+    message: Message,
 ):
-
     chat_id = message.chat.id
 
     if not is_managed_group(chat_id):
         return
 
-    # Все команды пропускаем.
-    # Они обрабатываются отдельными handlers.
-    if message.text and message.text.startswith("/"):
+    if not message.from_user:
         return
 
-    # Админы не попадают под ограничения.
+    # Администраторы не попадают под RO/ЧС.
     if await is_group_admin(
         chat_id,
-        message.from_user.id
+        message.from_user.id,
     ):
         return
 
@@ -996,14 +1029,14 @@ async def group_message_filter(
     if get_setting(
         chat_id,
         "readonly",
-        0
+        0,
     ):
 
         await safe_delete(message)
 
         increment_stat(
             chat_id,
-            "messages_deleted"
+            "messages_deleted",
         )
 
         return
@@ -1019,7 +1052,7 @@ async def group_message_filter(
         WHERE chat_id = ?
         ORDER BY LENGTH(word) DESC
         """,
-        (chat_id,)
+        (chat_id,),
     ).fetchall()
 
     if not rows:
@@ -1033,13 +1066,15 @@ async def group_message_filter(
 
     for row in rows:
 
-        if row["word"].lower() in content:
+        word = row["word"].lower()
+
+        if word and word in content:
 
             await safe_delete(message)
 
             increment_stat(
                 chat_id,
-                "messages_deleted"
+                "messages_deleted",
             )
 
             return
@@ -1050,7 +1085,6 @@ async def group_message_filter(
 # =========================================================
 
 def parse_duration(value):
-
     value = value.lower().strip()
 
     match = re.fullmatch(
@@ -1059,7 +1093,7 @@ def parse_duration(value):
         r"м|мин|минут[аы]?|"
         r"ч|час|часа|"
         r"д|дн|день|дня|дней)",
-        value
+        value,
     )
 
     if not match:
@@ -1076,7 +1110,7 @@ def parse_duration(value):
         "сек",
         "секунда",
         "секунды",
-        "секунд"
+        "секунд",
     }:
         return timedelta(
             seconds=number
@@ -1086,7 +1120,8 @@ def parse_duration(value):
         "м",
         "мин",
         "минута",
-        "минуты"
+        "минуты",
+        "минут",
     }:
         return timedelta(
             minutes=number
@@ -1095,7 +1130,8 @@ def parse_duration(value):
     if unit in {
         "ч",
         "час",
-        "часа"
+        "часа",
+        "часов",
     }:
         return timedelta(
             hours=number
@@ -1110,12 +1146,12 @@ def parse_mute(text):
 
     parts = text.split()
 
-    if len(parts) < 3:
+    if len(parts) < 2:
         return None
 
-    # -------------------------
+    # -----------------------------------------------------
     # /mut причина 10м
-    # -------------------------
+    # -----------------------------------------------------
 
     duration = parse_duration(
         parts[-1]
@@ -1132,17 +1168,17 @@ def parse_mute(text):
 
         return (
             reason,
-            duration
+            duration,
         )
 
-    # -------------------------
+    # -----------------------------------------------------
     # /mut причина 07.10.2026 09:00
-    # -------------------------
+    # -----------------------------------------------------
 
     match = re.search(
         r"(\d{2}\.\d{2}\.\d{4})\s+"
         r"(\d{2}:\d{2})\s*$",
-        text
+        text,
     )
 
     if not match:
@@ -1157,17 +1193,21 @@ def parse_mute(text):
 
     try:
 
-        target = datetime.strptime(
+        naive_target = datetime.strptime(
             (
                 f"{match.group(1)} "
                 f"{match.group(2)}"
             ),
-            "%d.%m.%Y %H:%M"
+            "%d.%m.%Y %H:%M",
         )
 
-        # Для команды с точной датой используем
-        # локальное время машины без UTC-конвертации.
-        now = datetime.now()
+        target = naive_target.replace(
+            tzinfo=LOCAL_TIMEZONE
+        )
+
+        now = datetime.now(
+            LOCAL_TIMEZONE
+        )
 
         duration = target - now
 
@@ -1176,7 +1216,7 @@ def parse_mute(text):
 
         return (
             reason,
-            duration
+            duration,
         )
 
     except Exception:
@@ -1185,14 +1225,16 @@ def parse_mute(text):
 
 def format_duration(seconds):
 
-    seconds = int(seconds)
+    seconds = max(
+        1,
+        int(seconds),
+    )
 
     days = seconds // 86400
     hours = seconds // 3600
     minutes = seconds // 60
 
     if days > 0:
-
         return (
             f"{days} дн. "
             f"({hours} ч / "
@@ -1200,14 +1242,12 @@ def format_duration(seconds):
         ).replace(",", " ")
 
     if hours > 0:
-
         return (
             f"{hours} ч "
             f"({seconds:,} сек)"
         ).replace(",", " ")
 
     if minutes > 0:
-
         return (
             f"{minutes} мин "
             f"({seconds:,} сек)"
@@ -1220,9 +1260,8 @@ def format_duration(seconds):
     Command("mut")
 )
 async def mute_command(
-    message: Message
+    message: Message,
 ):
-
     chat_id = message.chat.id
 
     if not is_managed_group(chat_id):
@@ -1231,7 +1270,7 @@ async def mute_command(
 
     if not await is_group_admin(
         chat_id,
-        message.from_user.id
+        message.from_user.id,
     ):
         await safe_delete(message)
         return
@@ -1244,9 +1283,13 @@ async def mute_command(
         message.reply_to_message.from_user
     )
 
+    if not target:
+        await safe_delete(message)
+        return
+
     if await is_group_admin(
         chat_id,
-        target.id
+        target.id,
     ):
         await safe_delete(message)
         return
@@ -1267,7 +1310,7 @@ async def mute_command(
             "<code>/mut причина 2ч</code>\n"
             "<code>/mut причина 3д</code>\n\n"
             "Или:\n"
-            "<code>/mut причина 07.10.2026 09:00</code>"
+            "<code>/mut причина 07.10.2026 09:00</code>",
         )
 
         return
@@ -1276,16 +1319,14 @@ async def mute_command(
 
     seconds = max(
         1,
-        int(duration.total_seconds())
+        int(duration.total_seconds()),
     )
 
-    # КРИТИЧЕСКИ ВАЖНО:
-    # Telegram получает Unix timestamp.
-    # Поэтому переводим время в UTC.
-    until = datetime.now(
-        timezone.utc
-    ) + timedelta(
-        seconds=seconds
+    # Всегда используем UTC-aware datetime.
+    # Telegram получает корректный абсолютный момент.
+    until = (
+        datetime.now(timezone.utc)
+        + timedelta(seconds=seconds)
     )
 
     try:
@@ -1305,7 +1346,7 @@ async def mute_command(
                 can_send_other_messages=False,
                 can_add_web_page_previews=False,
             ),
-            until_date=until
+            until_date=until,
         )
 
     except Exception as e:
@@ -1318,31 +1359,28 @@ async def mute_command(
 
         await send_bot_message(
             chat_id,
-            "❌ Не удалось выдать мут.\n"
-            "Проверь права бота."
+            "❌ <b>Не удалось выдать мут.</b>\n\n"
+            "Проверь, что бот является администратором "
+            "и имеет право ограничивать участников.",
         )
 
         return
 
     increment_stat(
         chat_id,
-        "mutes"
+        "mutes",
     )
 
     await safe_delete(message)
-
-    duration_text = format_duration(
-        seconds
-    )
 
     await send_bot_message(
         chat_id,
         "🚫 <b>Пользователь получает ограничение</b>\n\n"
         f"👤 {display_user(target)}\n"
-        f"⏳ <b>Срок:</b> {duration_text}\n"
+        f"⏳ <b>Срок:</b> {format_duration(seconds)}\n"
         f"📌 <b>Причина:</b> {escape_text(reason)}\n"
         f'📜 <b>Правила:</b> '
-        f'<a href="{RULES_URL}">открыть</a>'
+        f'<a href="{RULES_URL}">открыть</a>',
     )
 
 
@@ -1354,9 +1392,8 @@ async def mute_command(
     Command("unmut")
 )
 async def unmute_command(
-    message: Message
+    message: Message,
 ):
-
     chat_id = message.chat.id
 
     if not is_managed_group(chat_id):
@@ -1365,7 +1402,7 @@ async def unmute_command(
 
     if not await is_group_admin(
         chat_id,
-        message.from_user.id
+        message.from_user.id,
     ):
         await safe_delete(message)
         return
@@ -1377,6 +1414,10 @@ async def unmute_command(
     target = (
         message.reply_to_message.from_user
     )
+
+    if not target:
+        await safe_delete(message)
+        return
 
     try:
 
@@ -1394,10 +1435,14 @@ async def unmute_command(
                 can_send_polls=True,
                 can_send_other_messages=True,
                 can_add_web_page_previews=True,
-            )
+            ),
         )
 
-    except Exception:
+    except Exception as e:
+
+        logger.error(
+            f"Unmute error: {e}"
+        )
 
         await safe_delete(message)
         return
@@ -1407,7 +1452,7 @@ async def unmute_command(
     await send_bot_message(
         chat_id,
         f"🔓 Ограничение с "
-        f"{mention(target)} снято."
+        f"{mention(target)} снято.",
     )
 
 
@@ -1419,9 +1464,8 @@ async def unmute_command(
     Command("ban")
 )
 async def ban_command(
-    message: Message
+    message: Message,
 ):
-
     chat_id = message.chat.id
 
     if not is_managed_group(chat_id):
@@ -1430,7 +1474,7 @@ async def ban_command(
 
     if not await is_group_admin(
         chat_id,
-        message.from_user.id
+        message.from_user.id,
     ):
         await safe_delete(message)
         return
@@ -1443,9 +1487,13 @@ async def ban_command(
         message.reply_to_message.from_user
     )
 
+    if not target:
+        await safe_delete(message)
+        return
+
     if await is_group_admin(
         chat_id,
-        target.id
+        target.id,
     ):
         await safe_delete(message)
         return
@@ -1454,17 +1502,21 @@ async def ban_command(
 
         await bot.ban_chat_member(
             chat_id=chat_id,
-            user_id=target.id
+            user_id=target.id,
         )
 
-    except Exception:
+    except Exception as e:
+
+        logger.error(
+            f"Ban error: {e}"
+        )
 
         await safe_delete(message)
         return
 
     increment_stat(
         chat_id,
-        "bans"
+        "bans",
     )
 
     await safe_delete(message)
@@ -1472,7 +1524,7 @@ async def ban_command(
     await send_bot_message(
         chat_id,
         f"🔨 {mention(target)} "
-        "заблокирован в группе."
+        "заблокирован в группе.",
     )
 
 
@@ -1484,9 +1536,8 @@ async def ban_command(
     Command("kick")
 )
 async def kick_command(
-    message: Message
+    message: Message,
 ):
-
     chat_id = message.chat.id
 
     if not is_managed_group(chat_id):
@@ -1495,7 +1546,7 @@ async def kick_command(
 
     if not await is_group_admin(
         chat_id,
-        message.from_user.id
+        message.from_user.id,
     ):
         await safe_delete(message)
         return
@@ -1508,27 +1559,28 @@ async def kick_command(
         message.reply_to_message.from_user
     )
 
+    if not target:
+        await safe_delete(message)
+        return
+
     if await is_group_admin(
         chat_id,
-        target.id
+        target.id,
     ):
         await safe_delete(message)
         return
 
     try:
 
-        # Баним и сразу снимаем бан.
-        # Поэтому пользователь исключён,
-        # но сможет снова войти.
         await bot.ban_chat_member(
             chat_id=chat_id,
-            user_id=target.id
+            user_id=target.id,
         )
 
         await bot.unban_chat_member(
             chat_id=chat_id,
             user_id=target.id,
-            only_if_banned=True
+            only_if_banned=True,
         )
 
     except Exception as e:
@@ -1542,7 +1594,7 @@ async def kick_command(
 
     increment_stat(
         chat_id,
-        "kicks"
+        "kicks",
     )
 
     await safe_delete(message)
@@ -1551,68 +1603,67 @@ async def kick_command(
         chat_id,
         f"🚪 {mention(target)} "
         "исключён из группы.\n\n"
-        "Он сможет вернуться по ссылке-приглашению."
+        "Он сможет вернуться по ссылке-приглашению.",
     )
 
 
 # =========================================================
-# RO
+# READ ONLY
 # =========================================================
 
-async def enable_readonly(
-    chat_id
-):
+ALL_PERMISSIONS = ChatPermissions(
+    can_send_messages=True,
+    can_send_audios=True,
+    can_send_documents=True,
+    can_send_photos=True,
+    can_send_videos=True,
+    can_send_video_notes=True,
+    can_send_voice_notes=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+)
+
+
+NO_PERMISSIONS = ChatPermissions(
+    can_send_messages=False,
+    can_send_audios=False,
+    can_send_documents=False,
+    can_send_photos=False,
+    can_send_videos=False,
+    can_send_video_notes=False,
+    can_send_voice_notes=False,
+    can_send_polls=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False,
+)
+
+
+async def enable_readonly(chat_id):
+
+    await bot.set_chat_permissions(
+        chat_id=chat_id,
+        permissions=NO_PERMISSIONS,
+    )
 
     set_setting(
         chat_id,
         "readonly",
-        1
+        1,
     )
 
-    # Запрещаем писать обычным участникам.
-    # Важно: изменение default permissions
-    # применяется к обычным участникам.
+
+async def disable_readonly(chat_id):
+
     await bot.set_chat_permissions(
         chat_id=chat_id,
-        permissions=ChatPermissions(
-            can_send_messages=False,
-            can_send_audios=False,
-            can_send_documents=False,
-            can_send_photos=False,
-            can_send_videos=False,
-            can_send_video_notes=False,
-            can_send_voice_notes=False,
-            can_send_polls=False,
-            can_send_other_messages=False,
-            can_add_web_page_previews=False,
-        )
+        permissions=ALL_PERMISSIONS,
     )
-
-
-async def disable_readonly(
-    chat_id
-):
 
     set_setting(
         chat_id,
         "readonly",
-        0
-    )
-
-    await bot.set_chat_permissions(
-        chat_id=chat_id,
-        permissions=ChatPermissions(
-            can_send_messages=True,
-            can_send_audios=True,
-            can_send_documents=True,
-            can_send_photos=True,
-            can_send_videos=True,
-            can_send_video_notes=True,
-            can_send_voice_notes=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True,
-        )
+        0,
     )
 
 
@@ -1620,9 +1671,8 @@ async def disable_readonly(
     Command("ro")
 )
 async def ro_command(
-    message: Message
+    message: Message,
 ):
-
     chat_id = message.chat.id
 
     if not is_managed_group(chat_id):
@@ -1631,17 +1681,15 @@ async def ro_command(
 
     if not await is_group_admin(
         chat_id,
-        message.from_user.id
+        message.from_user.id,
     ):
         await safe_delete(message)
         return
 
     try:
-
         await enable_readonly(
             chat_id
         )
-
     except Exception as e:
 
         logger.error(
@@ -1657,7 +1705,7 @@ async def ro_command(
         chat_id,
         "🔒 <b>Режим «только чтение» включён.</b>\n\n"
         "Обычные участники не могут писать.\n"
-        "Администраторы могут."
+        "Администраторы могут.",
     )
 
 
@@ -1665,9 +1713,8 @@ async def ro_command(
     Command("unro")
 )
 async def unro_command(
-    message: Message
+    message: Message,
 ):
-
     chat_id = message.chat.id
 
     if not is_managed_group(chat_id):
@@ -1676,17 +1723,15 @@ async def unro_command(
 
     if not await is_group_admin(
         chat_id,
-        message.from_user.id
+        message.from_user.id,
     ):
         await safe_delete(message)
         return
 
     try:
-
         await disable_readonly(
             chat_id
         )
-
     except Exception as e:
 
         logger.error(
@@ -1701,8 +1746,116 @@ async def unro_command(
     await send_bot_message(
         chat_id,
         "🔓 <b>Режим «только чтение» выключен.</b>\n\n"
-        "Обычные участники снова могут писать."
+        "Обычные участники снова могут писать.",
     )
+
+
+# =========================================================
+# DROP
+# =========================================================
+
+DROP_ITEMS = [
+    ("🌱", "Дикий хрен"),
+    ("🍓", "Клубника"),
+    ("🍄", "Лисичка"),
+    ("🫐", "Черника"),
+    ("🌽", "Кукуруза"),
+    ("🥕", "Морковь"),
+    ("🍎", "Яблоко"),
+    ("🍇", "Виноград"),
+    ("🌻", "Подсолнух"),
+    ("🥔", "Картофель"),
+    ("🧅", "Лук"),
+    ("🍅", "Помидор"),
+    ("🌾", "Пшеница"),
+    ("🌳", "Дерево"),
+    ("🪨", "Камень"),
+    ("💎", "Алмаз"),
+    ("🟣", "Аметист"),
+    ("🔮", "Кварц"),
+    ("🐟", "Рыба"),
+    ("🦀", "Краб"),
+]
+
+
+def make_drop():
+    result = random.sample(
+        DROP_ITEMS,
+        3,
+    )
+
+    return " • ".join(
+        f"{emoji} {name}"
+        for emoji, name in result
+    )
+
+
+def drop_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎲 Ещё",
+                    callback_data="drop_again",
+                )
+            ]
+        ]
+    )
+
+
+async def send_drop(
+    chat_id,
+):
+    return await send_bot_message(
+        chat_id,
+        "🎁 <b>Тебе выпало:</b>\n\n"
+        f"{make_drop()}",
+        drop_keyboard(),
+    )
+
+
+@dp.message(
+    Command("drop")
+)
+async def drop_command(
+    message: Message,
+):
+    if not is_managed_group(
+        message.chat.id
+    ):
+        return
+
+    await safe_delete(message)
+
+    await send_drop(
+        message.chat.id
+    )
+
+
+@dp.callback_query(
+    F.data == "drop_again"
+)
+async def drop_again_callback(
+    callback: CallbackQuery,
+):
+    chat_id = callback.message.chat.id
+
+    if not is_managed_group(chat_id):
+        return
+
+    try:
+        await callback.message.edit_text(
+            "🎁 <b>Тебе выпало:</b>\n\n"
+            f"{make_drop()}",
+            parse_mode="HTML",
+            reply_markup=add_delete_button(
+                drop_keyboard()
+            ),
+        )
+    except Exception:
+        pass
+
+    await callback.answer()
 
 
 # =========================================================
@@ -1716,43 +1869,15 @@ def admin_groups_keyboard():
             [
                 InlineKeyboardButton(
                     text="🏠 Основной чат",
-                    callback_data=(
-                        "admin_group:-1001659597072"
-                    )
+                    callback_data="admin_group:-1001659597072",
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="🧪 Тестовый чат",
-                    callback_data=(
-                        "admin_group:-1004469030958"
-                    )
-                )
-            ]
-        ]
-    )
-
-
-def admin_home_keyboard():
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🏠 Основной чат",
-                    callback_data=(
-                        "admin_group:-1001659597072"
-                    )
+                    callback_data="admin_group:-1004469030958",
                 )
             ],
-            [
-                InlineKeyboardButton(
-                    text="🧪 Тестовый чат",
-                    callback_data=(
-                        "admin_group:-1004469030958"
-                    )
-                ]
-            ]
         ]
     )
 
@@ -1765,37 +1890,8 @@ def admin_home_text():
     )
 
 
-@dp.message(
-    Command("admin")
-)
-async def admin_command(
-    message: Message
-):
-
-    if not is_bot_admin(
-        message.from_user.id
-    ):
-        await safe_delete(message)
-        return
-
-    await safe_delete(message)
-
-    sent = await send_bot_message(
-        message.chat.id,
-        admin_home_text(),
-        admin_home_keyboard()
-    )
-
-    admin_states[
-        message.from_user.id
-    ] = {
-        "message_id": sent.message_id,
-        "chat_id": message.chat.id,
-    }
-
-
 def selected_group_keyboard(
-    chat_id
+    chat_id,
 ):
 
     return InlineKeyboardMarkup(
@@ -1803,111 +1899,200 @@ def selected_group_keyboard(
             [
                 InlineKeyboardButton(
                     text="🛡 Модерация",
-                    callback_data=(
-                        f"admin_moderation:{chat_id}"
-                    )
+                    callback_data=f"admin_moderation:{chat_id}",
                 ),
                 InlineKeyboardButton(
                     text="🚫 Чёрный список",
-                    callback_data=(
-                        f"admin_blacklist:{chat_id}"
-                    )
-                )
+                    callback_data=f"admin_blacklist:{chat_id}",
+                ),
             ],
             [
                 InlineKeyboardButton(
                     text="⚙️ Настройки",
-                    callback_data=(
-                        f"admin_settings:{chat_id}"
-                    )
+                    callback_data=f"admin_settings:{chat_id}",
                 ),
                 InlineKeyboardButton(
                     text="📊 Статистика",
-                    callback_data=(
-                        f"admin_stats:{chat_id}"
-                    )
-                )
+                    callback_data=f"admin_stats:{chat_id}",
+                ),
             ],
             [
                 InlineKeyboardButton(
                     text="‹ Выбрать другую группу",
-                    callback_data="admin_home"
+                    callback_data="admin_home",
                 )
-            ]
+            ],
         ]
     )
 
+
+async def edit_admin_panel(
+    user_id,
+    text,
+    keyboard,
+):
+    state = admin_states.get(user_id)
+
+    if not state:
+        return False
+
+    private_chat_id = state.get(
+        "private_chat_id"
+    )
+
+    message_id = state.get(
+        "message_id"
+    )
+
+    if not private_chat_id or not message_id:
+        return False
+
+    try:
+
+        await bot.edit_message_text(
+            chat_id=private_chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=add_delete_button(
+                keyboard
+            ),
+        )
+
+        return True
+
+    except Exception as e:
+
+        logger.error(
+            f"Admin panel edit error: {e}"
+        )
+
+        return False
+
+
+@dp.message(
+    Command("admin"),
+    F.chat.type == ChatType.PRIVATE,
+)
+async def admin_command(
+    message: Message,
+):
+    if not is_bot_admin(
+        message.from_user.id
+    ):
+        return
+
+    await safe_delete(message)
+
+    sent = await send_bot_message(
+        message.chat.id,
+        admin_home_text(),
+        admin_groups_keyboard(),
+    )
+
+    admin_states[
+        message.from_user.id
+    ] = {
+        "private_chat_id": message.chat.id,
+        "message_id": sent.message_id,
+        "selected_group": None,
+        "action": None,
+    }
+
+
+# =========================================================
+# ADMIN HOME
+# =========================================================
 
 @dp.callback_query(
     F.data == "admin_home"
 )
 async def admin_home_callback(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     if not is_bot_admin(
         callback.from_user.id
     ):
         return
 
+    state = admin_states.get(
+        callback.from_user.id
+    )
+
+    if state:
+        state["private_chat_id"] = (
+            callback.message.chat.id
+        )
+        state["message_id"] = (
+            callback.message.message_id
+        )
+        state["selected_group"] = None
+        state["action"] = None
+
     await callback.message.edit_text(
         admin_home_text(),
         parse_mode="HTML",
         reply_markup=add_delete_button(
-            admin_home_keyboard()
-        )
+            admin_groups_keyboard()
+        ),
     )
 
     await callback.answer()
 
 
 # =========================================================
-# ВЫБОР ГРУППЫ
+# SELECT GROUP
 # =========================================================
 
 @dp.callback_query(
     F.data.startswith("admin_group:")
 )
 async def admin_group_callback(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     if not is_bot_admin(
         callback.from_user.id
     ):
         return
 
-    chat_id = int(
-        callback.data.split(":")[1]
-    )
+    try:
+        chat_id = int(
+            callback.data.split(":")[1]
+        )
+    except Exception:
+        return
 
-    if chat_id not in GROUPS:
+    if not is_managed_group(chat_id):
         await callback.answer(
             "Группа не найдена.",
-            show_alert=True
+            show_alert=True,
         )
         return
 
     admin_states[
         callback.from_user.id
     ] = {
-        "chat_id": chat_id,
+        "private_chat_id": callback.message.chat.id,
         "message_id": callback.message.message_id,
+        "selected_group": chat_id,
+        "action": None,
     }
 
     readonly = get_setting(
         chat_id,
-        "readonly"
+        "readonly",
     )
 
     captcha = get_setting(
         chat_id,
         "captcha_enabled",
-        1
+        1,
     )
 
     text = (
-        f"🛠 <b>{escape_text(group_title(chat_id))}</b>\n\n"
+        f"🛠 <b>Управление: "
+        f"{escape_text(group_title(chat_id))}</b>\n\n"
         f"ID: <code>{chat_id}</code>\n\n"
         f"🔒 RO: "
         f"<b>{'ВКЛ' if readonly else 'ВЫКЛ'}</b>\n"
@@ -1920,40 +2105,46 @@ async def admin_group_callback(
         text,
         parse_mode="HTML",
         reply_markup=add_delete_button(
-            selected_group_keyboard(
-                chat_id
-            )
-        )
+            selected_group_keyboard(chat_id)
+        ),
     )
 
     await callback.answer()
 
 
 # =========================================================
-# MODERATION MENU
+# MODERATION
 # =========================================================
 
 @dp.callback_query(
     F.data.startswith("admin_moderation:")
 )
 async def admin_moderation_callback(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     if not is_bot_admin(
         callback.from_user.id
     ):
         return
 
-    chat_id = int(
-        callback.data.split(":")[1]
-    )
+    try:
+        chat_id = int(
+            callback.data.split(":")[1]
+        )
+    except Exception:
+        return
+
+    if not is_managed_group(chat_id):
+        return
 
     text = (
         f"🛡 <b>Модерация — "
         f"{escape_text(group_title(chat_id))}</b>\n\n"
         "Команды используются в самой группе:\n\n"
         "• <code>/mut причина 10м</code>\n"
+        "• <code>/mut причина 3ч</code>\n"
+        "• <code>/mut причина 3д</code>\n"
+        "• <code>/mut причина 07.10.2026 09:00</code>\n"
         "• <code>/unmut</code>\n"
         "• <code>/kick</code>\n"
         "• <code>/ban</code>\n"
@@ -1968,25 +2159,19 @@ async def admin_moderation_callback(
             [
                 InlineKeyboardButton(
                     text="🔒 Включить RO",
-                    callback_data=(
-                        f"admin_quick_ro:{chat_id}"
-                    )
+                    callback_data=f"admin_quick_ro:{chat_id}",
                 ),
                 InlineKeyboardButton(
                     text="🔓 Выключить RO",
-                    callback_data=(
-                        f"admin_quick_unro:{chat_id}"
-                    )
-                )
+                    callback_data=f"admin_quick_unro:{chat_id}",
+                ),
             ],
             [
                 InlineKeyboardButton(
                     text="‹ Назад",
-                    callback_data=(
-                        f"admin_group:{chat_id}"
-                    )
+                    callback_data=f"admin_group:{chat_id}",
                 )
-            ]
+            ],
         ]
     )
 
@@ -1995,23 +2180,18 @@ async def admin_moderation_callback(
         parse_mode="HTML",
         reply_markup=add_delete_button(
             keyboard
-        )
+        ),
     )
 
     await callback.answer()
 
 
-# =========================================================
-# QUICK RO
-# =========================================================
-
 @dp.callback_query(
     F.data.startswith("admin_quick_ro:")
 )
 async def admin_quick_ro(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     if not is_bot_admin(
         callback.from_user.id
     ):
@@ -2022,20 +2202,17 @@ async def admin_quick_ro(
     )
 
     try:
-
         await enable_readonly(
             chat_id
         )
-
     except Exception as e:
 
-        await callback.answer(
-            "Не удалось изменить права. "
-            "Проверь права бота в группе.",
-            show_alert=True
-        )
-
         logger.error(e)
+
+        await callback.answer(
+            "Не удалось включить RO.",
+            show_alert=True,
+        )
         return
 
     await callback.answer(
@@ -2047,9 +2224,8 @@ async def admin_quick_ro(
     F.data.startswith("admin_quick_unro:")
 )
 async def admin_quick_unro(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     if not is_bot_admin(
         callback.from_user.id
     ):
@@ -2060,20 +2236,17 @@ async def admin_quick_unro(
     )
 
     try:
-
         await disable_readonly(
             chat_id
         )
-
     except Exception as e:
 
-        await callback.answer(
-            "Не удалось изменить права. "
-            "Проверь права бота в группе.",
-            show_alert=True
-        )
-
         logger.error(e)
+
+        await callback.answer(
+            "Не удалось выключить RO.",
+            show_alert=True,
+        )
         return
 
     await callback.answer(
@@ -2085,13 +2258,63 @@ async def admin_quick_unro(
 # SETTINGS
 # =========================================================
 
+def settings_keyboard(
+    chat_id,
+):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔒 Переключить RO",
+                    callback_data=f"toggle_ro:{chat_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧮 Переключить CAPTCHA",
+                    callback_data=f"toggle_captcha:{chat_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="‹ Назад",
+                    callback_data=f"admin_group:{chat_id}",
+                )
+            ],
+        ]
+    )
+
+
+def settings_text(
+    chat_id,
+):
+    readonly = get_setting(
+        chat_id,
+        "readonly",
+    )
+
+    captcha = get_setting(
+        chat_id,
+        "captcha_enabled",
+        1,
+    )
+
+    return (
+        f"⚙️ <b>Настройки — "
+        f"{escape_text(group_title(chat_id))}</b>\n\n"
+        f"🔒 Только чтение: "
+        f"<b>{'ВКЛ' if readonly else 'ВЫКЛ'}</b>\n"
+        f"🧮 CAPTCHA: "
+        f"<b>{'ВКЛ' if captcha else 'ВЫКЛ'}</b>"
+    )
+
+
 @dp.callback_query(
     F.data.startswith("admin_settings:")
 )
 async def admin_settings_callback(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     if not is_bot_admin(
         callback.from_user.id
     ):
@@ -2101,61 +2324,15 @@ async def admin_settings_callback(
         callback.data.split(":")[1]
     )
 
-    readonly = get_setting(
-        chat_id,
-        "readonly"
-    )
-
-    captcha = get_setting(
-        chat_id,
-        "captcha_enabled",
-        1
-    )
-
-    text = (
-        f"⚙️ <b>Настройки — "
-        f"{escape_text(group_title(chat_id))}</b>\n\n"
-        f"🔒 Только чтение: "
-        f"<b>{'ВКЛ' if readonly else 'ВЫКЛ'}</b>\n"
-        f"🧮 CAPTCHA: "
-        f"<b>{'ВКЛ' if captcha else 'ВЫКЛ'}</b>"
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔒 Переключить RO",
-                    callback_data=(
-                        f"toggle_ro:{chat_id}"
-                    )
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🧮 Переключить CAPTCHA",
-                    callback_data=(
-                        f"toggle_captcha:{chat_id}"
-                    )
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="‹ Назад",
-                    callback_data=(
-                        f"admin_group:{chat_id}"
-                    )
-                )
-            ]
-        ]
-    )
+    if not is_managed_group(chat_id):
+        return
 
     await callback.message.edit_text(
-        text,
+        settings_text(chat_id),
         parse_mode="HTML",
         reply_markup=add_delete_button(
-            keyboard
-        )
+            settings_keyboard(chat_id)
+        ),
     )
 
     await callback.answer()
@@ -2165,9 +2342,8 @@ async def admin_settings_callback(
     F.data.startswith("toggle_ro:")
 )
 async def toggle_ro_callback(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     if not is_bot_admin(
         callback.from_user.id
     ):
@@ -2179,44 +2355,42 @@ async def toggle_ro_callback(
 
     current = get_setting(
         chat_id,
-        "readonly"
+        "readonly",
     )
 
     try:
 
         if current:
-
             await disable_readonly(
                 chat_id
             )
-
-            text = "🔓 RO выключен."
-
+            answer = "RO выключен."
         else:
-
             await enable_readonly(
                 chat_id
             )
+            answer = "RO включён."
 
-            text = "🔒 RO включён."
+    except Exception as e:
 
-    except Exception:
+        logger.error(e)
 
         await callback.answer(
-            "Не удалось изменить режим. "
-            "Проверь права бота.",
-            show_alert=True
+            "Не удалось изменить RO.",
+            show_alert=True,
         )
-
         return
 
     await callback.answer(
-        text
+        answer
     )
 
-    await refresh_settings_message(
-        callback,
-        chat_id
+    await callback.message.edit_text(
+        settings_text(chat_id),
+        parse_mode="HTML",
+        reply_markup=add_delete_button(
+            settings_keyboard(chat_id)
+        ),
     )
 
 
@@ -2224,9 +2398,8 @@ async def toggle_ro_callback(
     F.data.startswith("toggle_captcha:")
 )
 async def toggle_captcha_callback(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     if not is_bot_admin(
         callback.from_user.id
     ):
@@ -2239,135 +2412,62 @@ async def toggle_captcha_callback(
     current = get_setting(
         chat_id,
         "captcha_enabled",
-        1
+        1,
     )
 
     set_setting(
         chat_id,
         "captcha_enabled",
-        0 if current else 1
+        0 if current else 1,
     )
 
     await callback.answer(
         "Настройка изменена."
     )
 
-    await refresh_settings_message(
-        callback,
-        chat_id
+    await callback.message.edit_text(
+        settings_text(chat_id),
+        parse_mode="HTML",
+        reply_markup=add_delete_button(
+            settings_keyboard(chat_id)
+        ),
     )
-
-
-async def refresh_settings_message(
-    callback,
-    chat_id
-):
-
-    readonly = get_setting(
-        chat_id,
-        "readonly"
-    )
-
-    captcha = get_setting(
-        chat_id,
-        "captcha_enabled",
-        1
-    )
-
-    text = (
-        f"⚙️ <b>Настройки — "
-        f"{escape_text(group_title(chat_id))}</b>\n\n"
-        f"🔒 Только чтение: "
-        f"<b>{'ВКЛ' if readonly else 'ВЫКЛ'}</b>\n"
-        f"🧮 CAPTCHA: "
-        f"<b>{'ВКЛ' if captcha else 'ВЫКЛ'}</b>"
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔒 Переключить RO",
-                    callback_data=(
-                        f"toggle_ro:{chat_id}"
-                    )
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🧮 Переключить CAPTCHA",
-                    callback_data=(
-                        f"toggle_captcha:{chat_id}"
-                    )
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="‹ Назад",
-                    callback_data=(
-                        f"admin_group:{chat_id}"
-                    )
-                )
-            ]
-        ]
-    )
-
-    try:
-
-        await callback.message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=add_delete_button(
-                keyboard
-            )
-        )
-
-    except Exception:
-        pass
 
 
 # =========================================================
-# BLACKLIST MENU
+# BLACKLIST
 # =========================================================
 
 def blacklist_menu_keyboard(
-    chat_id
+    chat_id,
 ):
-
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="＋ Добавить слова",
-                    callback_data=(
-                        f"black_add:{chat_id}"
-                    )
+                    callback_data=f"black_add:{chat_id}",
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="− Удалить слово",
-                    callback_data=(
-                        f"black_delete:{chat_id}"
-                    )
+                    callback_data=f"black_delete:{chat_id}",
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="‹ Назад",
-                    callback_data=(
-                        f"admin_group:{chat_id}"
-                    )
+                    callback_data=f"admin_group:{chat_id}",
                 )
-            ]
+            ],
         ]
     )
 
 
 async def blacklist_text(
-    chat_id
+    chat_id,
 ):
-
     rows = db.execute(
         """
         SELECT word
@@ -2375,7 +2475,7 @@ async def blacklist_text(
         WHERE chat_id = ?
         ORDER BY word
         """,
-        (chat_id,)
+        (chat_id,),
     ).fetchall()
 
     if not rows:
@@ -2387,13 +2487,39 @@ async def blacklist_text(
     )
 
 
+async def show_blacklist(
+    callback: CallbackQuery,
+    chat_id: int,
+    extra="",
+):
+    words = await blacklist_text(
+        chat_id
+    )
+
+    text = (
+        f"🚫 <b>Чёрный список — "
+        f"{escape_text(group_title(chat_id))}</b>\n\n"
+        f"{words}"
+    )
+
+    if extra:
+        text += f"\n\n{extra}"
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=add_delete_button(
+            blacklist_menu_keyboard(chat_id)
+        ),
+    )
+
+
 @dp.callback_query(
     F.data.startswith("admin_blacklist:")
 )
 async def admin_blacklist_callback(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     if not is_bot_admin(
         callback.from_user.id
     ):
@@ -2403,26 +2529,12 @@ async def admin_blacklist_callback(
         callback.data.split(":")[1]
     )
 
-    words = await blacklist_text(
-        chat_id
-    )
+    if not is_managed_group(chat_id):
+        return
 
-    text = (
-        f"🚫 <b>Чёрный список — "
-        f"{escape_text(group_title(chat_id))}</b>\n\n"
-        f"{words}\n\n"
-        "Сообщения участников с этими словами "
-        "будут автоматически удаляться."
-    )
-
-    await callback.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=add_delete_button(
-            blacklist_menu_keyboard(
-                chat_id
-            )
-        )
+    await show_blacklist(
+        callback,
+        chat_id,
     )
 
     await callback.answer()
@@ -2436,9 +2548,8 @@ async def admin_blacklist_callback(
     F.data.startswith("black_add:")
 )
 async def black_add_callback(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     if not is_bot_admin(
         callback.from_user.id
     ):
@@ -2451,9 +2562,10 @@ async def black_add_callback(
     admin_states[
         callback.from_user.id
     ] = {
-        "chat_id": chat_id,
+        "private_chat_id": callback.message.chat.id,
         "message_id": callback.message.message_id,
-        "action": "blacklist_add"
+        "selected_group": chat_id,
+        "action": "blacklist_add",
     }
 
     keyboard = InlineKeyboardMarkup(
@@ -2461,9 +2573,7 @@ async def black_add_callback(
             [
                 InlineKeyboardButton(
                     text="‹ Назад",
-                    callback_data=(
-                        f"admin_blacklist:{chat_id}"
-                    )
+                    callback_data=f"admin_blacklist:{chat_id}",
                 )
             ]
         ]
@@ -2480,7 +2590,7 @@ async def black_add_callback(
         parse_mode="HTML",
         reply_markup=add_delete_button(
             keyboard
-        )
+        ),
     )
 
     await callback.answer()
@@ -2494,9 +2604,8 @@ async def black_add_callback(
     F.data.startswith("black_delete:")
 )
 async def black_delete_callback(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     if not is_bot_admin(
         callback.from_user.id
     ):
@@ -2508,12 +2617,12 @@ async def black_delete_callback(
 
     rows = db.execute(
         """
-        SELECT word
+        SELECT rowid, word
         FROM blacklist
         WHERE chat_id = ?
         ORDER BY word
         """,
-        (chat_id,)
+        (chat_id,),
     ).fetchall()
 
     buttons = []
@@ -2522,36 +2631,21 @@ async def black_delete_callback(
 
         buttons.append([
             InlineKeyboardButton(
-                text=f"× {row['word']}",
+                text=f"× {row['word'][:30]}",
                 callback_data=(
                     f"black_remove:"
                     f"{chat_id}:"
-                    f"{row['word']}"
-                )
+                    f"{row['rowid']}"
+                ),
             )
         ])
 
-    if not buttons:
-
-        buttons.append([
-            InlineKeyboardButton(
-                text="‹ Назад",
-                callback_data=(
-                    f"admin_blacklist:{chat_id}"
-                )
-            )
-        ])
-
-    else:
-
-        buttons.append([
-            InlineKeyboardButton(
-                text="‹ Назад",
-                callback_data=(
-                    f"admin_blacklist:{chat_id}"
-                )
-            )
-        ])
+    buttons.append([
+        InlineKeyboardButton(
+            text="‹ Назад",
+            callback_data=f"admin_blacklist:{chat_id}",
+        )
+    ])
 
     await callback.message.edit_text(
         "− <b>Удаление слова</b>\n\n"
@@ -2561,7 +2655,7 @@ async def black_delete_callback(
             InlineKeyboardMarkup(
                 inline_keyboard=buttons
             )
-        )
+        ),
     )
 
     await callback.answer()
@@ -2571,9 +2665,8 @@ async def black_delete_callback(
     F.data.startswith("black_remove:")
 )
 async def black_remove_callback(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     if not is_bot_admin(
         callback.from_user.id
     ):
@@ -2581,25 +2674,28 @@ async def black_remove_callback(
 
     parts = callback.data.split(
         ":",
-        2
+        2,
     )
 
-    chat_id = int(
-        parts[1]
-    )
+    if len(parts) != 3:
+        return
 
-    word = parts[2]
+    try:
+        chat_id = int(parts[1])
+        rowid = int(parts[2])
+    except Exception:
+        return
 
     db.execute(
         """
         DELETE FROM blacklist
         WHERE chat_id = ?
-        AND word = ?
+        AND rowid = ?
         """,
         (
             chat_id,
-            word
-        )
+            rowid,
+        ),
     )
 
     db.commit()
@@ -2608,41 +2704,37 @@ async def black_remove_callback(
         "Слово удалено."
     )
 
-    words = await blacklist_text(
-        chat_id
-    )
-
-    await callback.message.edit_text(
-        f"🚫 <b>Чёрный список — "
-        f"{escape_text(group_title(chat_id))}</b>\n\n"
-        f"{words}",
-        parse_mode="HTML",
-        reply_markup=add_delete_button(
-            blacklist_menu_keyboard(
-                chat_id
-            )
-        )
+    await show_blacklist(
+        callback,
+        chat_id,
     )
 
 
 # =========================================================
-# BLACKLIST INPUT
+# PRIVATE ADMIN INPUT
+# =========================================================
+#
+# Здесь единственный обработчик обычных
+# личных сообщений администратора.
 # =========================================================
 
 @dp.message(
-    F.chat.type == "private"
+    F.chat.type == ChatType.PRIVATE
 )
 async def private_messages(
-    message: Message
+    message: Message,
 ):
+    user_id = message.from_user.id
 
-    if not is_bot_admin(
-        message.from_user.id
-    ):
+    if not is_bot_admin(user_id):
+        return
+
+    # /admin обрабатывается отдельным handler.
+    if message.text and message.text.startswith("/"):
         return
 
     state = admin_states.get(
-        message.from_user.id
+        user_id
     )
 
     if not state:
@@ -2651,7 +2743,20 @@ async def private_messages(
     if state.get("action") != "blacklist_add":
         return
 
-    chat_id = state["chat_id"]
+    chat_id = state.get(
+        "selected_group"
+    )
+
+    private_chat_id = state.get(
+        "private_chat_id"
+    )
+
+    panel_message_id = state.get(
+        "message_id"
+    )
+
+    if not chat_id:
+        return
 
     words = [
         word.strip().lower()
@@ -2665,7 +2770,44 @@ async def private_messages(
         dict.fromkeys(words)
     )
 
+    if not words:
+
+        await safe_delete(message)
+
+        try:
+            await bot.edit_message_text(
+                chat_id=private_chat_id,
+                message_id=panel_message_id,
+                text=(
+                    "⚠️ <b>Ничего не добавлено.</b>\n\n"
+                    "Отправь хотя бы одно слово."
+                ),
+                parse_mode="HTML",
+                reply_markup=add_delete_button(
+                    InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text="‹ Назад",
+                                    callback_data=(
+                                        f"admin_blacklist:{chat_id}"
+                                    ),
+                                )
+                            ]
+                        ]
+                    )
+                ),
+            )
+        except Exception:
+            pass
+
+        return
+
     for word in words:
+
+        # Не даём добавить слишком длинные значения.
+        if len(word) > 100:
+            continue
 
         db.execute(
             """
@@ -2675,53 +2817,42 @@ async def private_messages(
             """,
             (
                 chat_id,
-                word
-            )
+                word,
+            ),
         )
 
     db.commit()
 
     await safe_delete(message)
 
-    state_message_id = (
-        state["message_id"]
-    )
-
-    text = await blacklist_text(
-        chat_id
-    )
-
-    keyboard = blacklist_menu_keyboard(
+    words_text = await blacklist_text(
         chat_id
     )
 
     try:
 
         await bot.edit_message_text(
-            chat_id=state["chat_id"],
-            message_id=state_message_id,
+            chat_id=private_chat_id,
+            message_id=panel_message_id,
             text=(
                 f"🚫 <b>Чёрный список — "
                 f"{escape_text(group_title(chat_id))}</b>\n\n"
-                f"{text}\n\n"
-                "Список обновлён."
+                f"{words_text}\n\n"
+                "✅ Список обновлён."
             ),
             parse_mode="HTML",
             reply_markup=add_delete_button(
-                keyboard
-            )
+                blacklist_menu_keyboard(chat_id)
+            ),
         )
 
     except Exception as e:
 
         logger.error(
-            f"Blacklist edit error: {e}"
+            f"Blacklist panel edit error: {e}"
         )
 
-    admin_states.pop(
-        message.from_user.id,
-        None
-    )
+    state["action"] = None
 
 
 # =========================================================
@@ -2732,9 +2863,8 @@ async def private_messages(
     F.data.startswith("admin_stats:")
 )
 async def admin_stats_callback(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
     if not is_bot_admin(
         callback.from_user.id
     ):
@@ -2743,6 +2873,9 @@ async def admin_stats_callback(
     chat_id = int(
         callback.data.split(":")[1]
     )
+
+    if not is_managed_group(chat_id):
+        return
 
     stats = get_stats(
         chat_id
@@ -2754,7 +2887,7 @@ async def admin_stats_callback(
         FROM blacklist
         WHERE chat_id = ?
         """,
-        (chat_id,)
+        (chat_id,),
     ).fetchone()[0]
 
     captcha_count = db.execute(
@@ -2763,7 +2896,7 @@ async def admin_stats_callback(
         FROM captchas
         WHERE chat_id = ?
         """,
-        (chat_id,)
+        (chat_id,),
     ).fetchone()[0]
 
     text = (
@@ -2790,9 +2923,7 @@ async def admin_stats_callback(
             [
                 InlineKeyboardButton(
                     text="‹ Назад",
-                    callback_data=(
-                        f"admin_group:{chat_id}"
-                    )
+                    callback_data=f"admin_group:{chat_id}",
                 )
             ]
         ]
@@ -2803,7 +2934,7 @@ async def admin_stats_callback(
         parse_mode="HTML",
         reply_markup=add_delete_button(
             keyboard
-        )
+        ),
     )
 
     await callback.answer()
@@ -2817,19 +2948,17 @@ async def admin_stats_callback(
     Command("rules")
 )
 async def rules_command(
-    message: Message
+    message: Message,
 ):
-
     chat_id = message.chat.id
 
     if not is_managed_group(chat_id):
         await safe_delete(message)
         return
 
-    # Обычные пользователи НЕ могут /rules
     if not await is_group_admin(
         chat_id,
-        message.from_user.id
+        message.from_user.id,
     ):
         await safe_delete(message)
         return
@@ -2842,24 +2971,8 @@ async def rules_command(
         f'🔗 Полные правила: '
         f'<a href="{RULES_URL}">открыть</a>\n\n'
         "⚠️ Незнание правил не освобождает "
-        "от ответственности."
+        "от ответственности.",
     )
-
-
-# =========================================================
-# PRIVATE COMMANDS
-# =========================================================
-
-@dp.message(
-    F.chat.type == "private"
-)
-async def private_command_ignore(
-    message: Message
-):
-
-    # Все личные сообщения обычных пользователей
-    # полностью игнорируются.
-    pass
 
 
 # =========================================================
@@ -2879,14 +2992,13 @@ async def main():
     )
 
     logger.info(
-        f"Основной чат: -1001659597072"
+        "Основной чат: -1001659597072"
     )
 
     logger.info(
-        f"Тестовый чат: -1004469030958"
+        "Тестовый чат: -1004469030958"
     )
 
-    # Инициализируем настройки обеих групп.
     for chat_id in GROUPS:
         ensure_chat_settings(
             chat_id
@@ -2901,10 +3013,14 @@ async def main():
         allowed_updates=[
             "message",
             "callback_query",
-            "chat_join_request"
-        ]
+            "chat_join_request",
+        ],
     )
 
+
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
 
