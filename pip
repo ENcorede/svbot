@@ -3,10 +3,11 @@ import html
 import logging
 import os
 import random
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatMemberStatus
@@ -28,10 +29,20 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 ALLOWED_CHAT_ID = -1004469030958
 
+RULES_URL = "https://t.me/stardewrus_chat/1255258"
+
 WELCOME_BATCH_DELAY = 2
 GAME_WAIT_SECONDS = 180
 
 DB_NAME = "stardew_bot.sqlite3"
+
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "Не найден BOT_TOKEN.\n\n"
+        "Windows PowerShell:\n"
+        '$env:BOT_TOKEN="НОВЫЙ_ТОКЕН"\n'
+        "python bot.py"
+    )
 
 # =========================================================
 # ЛОГИ
@@ -44,13 +55,9 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-if not BOT_TOKEN:
-    raise RuntimeError(
-        "Не найден BOT_TOKEN.\n\n"
-        "Windows PowerShell:\n"
-        '$env:BOT_TOKEN="НОВЫЙ_ТОКЕН"\n'
-        "python bot.py"
-    )
+# =========================================================
+# BOT
+# =========================================================
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -94,8 +101,9 @@ welcome_tasks = {}
 games = {}
 game_timer_tasks = {}
 
+
 # =========================================================
-# GAME
+# TIC-TAC-TOE
 # =========================================================
 
 @dataclass
@@ -106,8 +114,8 @@ class Game:
     creator_id: int
     creator_name: str
 
-    player2_id: Optional[int] = None
-    player2_name: Optional[str] = None
+    player2_id: int | None = None
+    player2_name: str | None = None
 
     board: list = field(
         default_factory=lambda: [""] * 9
@@ -122,11 +130,10 @@ class Game:
 
 
 # =========================================================
-# USER MENTION
+# UTILS
 # =========================================================
 
-def mention_user(user_id: int, name: str):
-
+def mention_user(user_id: int, name: str) -> str:
     safe_name = html.escape(
         name or "Пользователь"
     )
@@ -136,6 +143,77 @@ def mention_user(user_id: int, name: str):
         f'{safe_name}'
         f'</a>'
     )
+
+
+def get_username(user) -> str:
+    if user.username:
+        return f"@{user.username}"
+
+    return user.full_name or "Пользователь"
+
+
+async def is_admin(
+    chat_id: int,
+    user_id: int
+) -> bool:
+
+    try:
+        member = await bot.get_chat_member(
+            chat_id,
+            user_id
+        )
+
+        return member.status in {
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.CREATOR
+        }
+
+    except Exception as e:
+        logger.error(
+            f"Ошибка проверки администратора: {e}"
+        )
+
+        return False
+
+
+async def delete_command(
+    message: Message
+):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+# =========================================================
+# PERMISSIONS
+# =========================================================
+
+BLOCKED_PERMISSIONS = ChatPermissions(
+    can_send_messages=False,
+    can_send_audios=False,
+    can_send_documents=False,
+    can_send_photos=False,
+    can_send_videos=False,
+    can_send_video_notes=False,
+    can_send_voice_notes=False,
+    can_send_polls=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False,
+)
+
+FULL_PERMISSIONS = ChatPermissions(
+    can_send_messages=True,
+    can_send_audios=True,
+    can_send_documents=True,
+    can_send_photos=True,
+    can_send_videos=True,
+    can_send_video_notes=True,
+    can_send_voice_notes=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+)
 
 
 # =========================================================
@@ -175,10 +253,26 @@ def create_captcha():
             options.add(value)
 
     options = list(options)
-
     random.shuffle(options)
 
     return question, answer, options
+
+
+def generate_options(answer: int):
+
+    options = {answer}
+
+    while len(options) < 4:
+
+        value = answer + random.randint(-5, 5)
+
+        if value >= 0:
+            options.add(value)
+
+    options = list(options)
+    random.shuffle(options)
+
+    return options
 
 
 def captcha_exists(chat_id: int):
@@ -195,20 +289,17 @@ def captcha_exists(chat_id: int):
     return row["count"] > 0
 
 
-# =========================================================
-# CAPTCHA KEYBOARD
-# =========================================================
-
-def build_captcha_keyboard(captcha_data):
+def captcha_keyboard(
+    captcha_data
+):
 
     keyboard = []
 
     for user_id, options in captcha_data:
 
-        # Отдельный визуальный разделитель
         keyboard.append([
             InlineKeyboardButton(
-                text="🔐 Капча пользователя",
+                text="🔐 Ответить на капчу",
                 callback_data=f"captcha_info:{user_id}"
             )
         ])
@@ -216,22 +307,30 @@ def build_captcha_keyboard(captcha_data):
         keyboard.append([
             InlineKeyboardButton(
                 text=str(options[0]),
-                callback_data=f"captcha:{user_id}:{options[0]}"
+                callback_data=(
+                    f"captcha:{user_id}:{options[0]}"
+                )
             ),
             InlineKeyboardButton(
                 text=str(options[1]),
-                callback_data=f"captcha:{user_id}:{options[1]}"
+                callback_data=(
+                    f"captcha:{user_id}:{options[1]}"
+                )
             )
         ])
 
         keyboard.append([
             InlineKeyboardButton(
                 text=str(options[2]),
-                callback_data=f"captcha:{user_id}:{options[2]}"
+                callback_data=(
+                    f"captcha:{user_id}:{options[2]}"
+                )
             ),
             InlineKeyboardButton(
                 text=str(options[3]),
-                callback_data=f"captcha:{user_id}:{options[3]}"
+                callback_data=(
+                    f"captcha:{user_id}:{options[3]}"
+                )
             )
         ])
 
@@ -241,86 +340,7 @@ def build_captcha_keyboard(captcha_data):
 
 
 # =========================================================
-# PERMISSIONS
-# =========================================================
-
-BLOCKED_PERMISSIONS = ChatPermissions(
-    can_send_messages=False,
-    can_send_audios=False,
-    can_send_documents=False,
-    can_send_photos=False,
-    can_send_videos=False,
-    can_send_video_notes=False,
-    can_send_voice_notes=False,
-    can_send_polls=False,
-    can_send_other_messages=False,
-    can_add_web_page_previews=False,
-)
-
-FULL_PERMISSIONS = ChatPermissions(
-    can_send_messages=True,
-    can_send_audios=True,
-    can_send_documents=True,
-    can_send_photos=True,
-    can_send_videos=True,
-    can_send_video_notes=True,
-    can_send_voice_notes=True,
-    can_send_polls=True,
-    can_send_other_messages=True,
-    can_add_web_page_previews=True,
-)
-
-
-async def restrict_user(
-    chat_id: int,
-    user_id: int
-):
-
-    try:
-
-        await bot.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
-            permissions=BLOCKED_PERMISSIONS
-        )
-
-        logger.info(
-            f"Пользователь {user_id} ограничен"
-        )
-
-    except Exception as e:
-
-        logger.error(
-            f"Ошибка ограничения {user_id}: {e}"
-        )
-
-
-async def unrestrict_user(
-    chat_id: int,
-    user_id: int
-):
-
-    try:
-
-        await bot.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
-            permissions=FULL_PERMISSIONS
-        )
-
-        logger.info(
-            f"Ограничение снято с {user_id}"
-        )
-
-    except Exception as e:
-
-        logger.error(
-            f"Ошибка снятия ограничения {user_id}: {e}"
-        )
-
-
-# =========================================================
-# WELCOME MESSAGES
+# CAPTCHA / WELCOME MESSAGE
 # =========================================================
 
 async def save_welcome(
@@ -359,12 +379,10 @@ async def delete_all_welcomes(
     for row in rows:
 
         try:
-
             await bot.delete_message(
                 chat_id=chat_id,
                 message_id=row["message_id"]
             )
-
         except Exception:
             pass
 
@@ -379,9 +397,79 @@ async def delete_all_welcomes(
     db.commit()
 
 
-# =========================================================
-# ОБЩЕЕ СООБЩЕНИЕ: ПРИВЕТСТВИЕ + КАПЧА
-# =========================================================
+async def build_current_captcha_message(
+    chat_id: int
+):
+
+    rows = db.execute(
+        """
+        SELECT *
+        FROM captchas
+        WHERE chat_id = ?
+        ORDER BY created_at ASC
+        """,
+        (chat_id,)
+    ).fetchall()
+
+    if not rows:
+        return None, None
+
+    text = (
+        "👋 <b>Добро пожаловать в Stardew Valley!</b>\n\n"
+        "🌻 Общаемся, помогаем новичкам и вместе играем.\n"
+        "Ознакомьтесь с правилами и соблюдайте их.\n\n"
+    )
+
+    captcha_data = []
+
+    for row in rows:
+
+        user_id = row["user_id"]
+
+        try:
+            member = await bot.get_chat_member(
+                chat_id,
+                user_id
+            )
+
+            user = member.user
+
+            user_name = get_username(user)
+            full_name = user.full_name
+
+        except Exception:
+
+            user_name = "пользователь"
+            full_name = "Пользователь"
+
+        text += (
+            f"👤 {mention_user(user_id, full_name)} "
+            f"({html.escape(user_name)})\n"
+        )
+
+        text += (
+            f"🧮 <code>{row['question']}</code> = ...\n"
+            "Выбери ответ ниже.\n\n"
+        )
+
+        captcha_data.append(
+            (
+                user_id,
+                generate_options(
+                    row["answer"]
+                )
+            )
+        )
+
+    text += (
+        "⚠️ Каждый участник может пройти "
+        "только свою капчу."
+    )
+
+    return text, captcha_keyboard(
+        captcha_data
+    )
+
 
 async def send_welcome_batch(
     chat_id: int
@@ -399,29 +487,16 @@ async def send_welcome_batch(
     if not users:
         return
 
-    # Если старых активных капч нет,
-    # старые приветствия удаляем.
+    # Если старых капч нет,
+    # старое приветствие можно удалить.
     if not captcha_exists(chat_id):
 
         await delete_all_welcomes(
             chat_id
         )
 
-    text = (
-        "👋 <b>Добро пожаловать в чат Stardew Valley!</b>\n\n"
-    )
-
-    captcha_data = []
-
-    for index, user in enumerate(users):
-
-        if index > 0:
-            text += "\n"
-
-        text += (
-            f"👤 {mention_user(user.id, user.full_name)}\n"
-            "📖 <a href=\"https://t.me/stardewrus_chat/1255258\">Правила</a>\n"
-        )
+    # Создаём капчи
+    for user in users:
 
         question, answer, options = create_captcha()
 
@@ -448,44 +523,15 @@ async def send_welcome_batch(
             )
         )
 
-        captcha_data.append(
-            (
-                user.id,
-                question,
-                options
-            )
-        )
+    db.commit()
 
-    text += "\n<b>🛡 ПРОВЕРКА</b>\n\n"
-
-    for index, item in enumerate(captcha_data):
-
-        user_id, question, options = item
-
-        user = next(
-            (
-                u for u in users
-                if u.id == user_id
-            ),
-            None
-        )
-
-        if not user:
-            continue
-
-        text += (
-            f"🔐 {mention_user(user.id, user.full_name)}\n"
-            f"Реши: <code>{question}</code>\n"
-            "Нажми правильный ответ ниже.\n\n"
-        )
-
-    text += (
-        "⚠️ Каждый участник может пройти "
-        "только свою капчу."
+    text, keyboard = await build_current_captcha_message(
+        chat_id
     )
 
-    # Временный ID сообщения 0 уже находится в БД.
-    # Сначала отправляем сообщение.
+    if not text:
+        return
+
     try:
 
         message = await bot.send_message(
@@ -493,23 +539,15 @@ async def send_welcome_batch(
             text=text,
             parse_mode="HTML",
             disable_web_page_preview=True,
-            reply_markup=build_captcha_keyboard(
-                [
-                    (user_id, options)
-                    for user_id, question, options
-                    in captcha_data
-                ]
-            )
+            reply_markup=keyboard
         )
 
     except Exception as e:
 
         logger.exception(
-            f"Ошибка отправки welcome: {e}"
+            f"Ошибка отправки приветствия: {e}"
         )
 
-        # Если сообщение не отправилось,
-        # удаляем созданные капчи.
         db.execute(
             """
             DELETE FROM captchas
@@ -522,7 +560,7 @@ async def send_welcome_batch(
 
         return
 
-    # Теперь сохраняем настоящий message_id
+    # Сохраняем ID сообщения капчи
     db.execute(
         """
         UPDATE captchas
@@ -560,7 +598,6 @@ async def queue_welcome(
     )
 
     if old_task and not old_task.done():
-
         old_task.cancel()
 
     welcome_tasks[chat_id] = asyncio.create_task(
@@ -569,7 +606,7 @@ async def queue_welcome(
 
 
 # =========================================================
-# JOIN REQUEST
+# ПРИСОЕДИНЕНИЕ
 # =========================================================
 
 @dp.chat_join_request()
@@ -590,17 +627,19 @@ async def join_request(
 
     try:
 
-        # 1. СНАЧАЛА принимаем
+        # СНАЧАЛА принимаем
         await request.approve()
 
-        # 2. Сразу ограничиваем писать
-        await restrict_user(
-            chat_id,
-            user.id
+        # Затем запрещаем писать
+        await bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=user.id,
+            permissions=BLOCKED_PERMISSIONS
         )
 
-        # 3. Добавляем в очередь
-        # Приветствие + капча будут ОДНИМ сообщением
+        # Добавляем в очередь.
+        # Если заявок несколько — они будут
+        # объединены в одно сообщение.
         await queue_welcome(
             chat_id,
             user
@@ -609,12 +648,12 @@ async def join_request(
     except Exception as e:
 
         logger.exception(
-            f"Ошибка заявки: {e}"
+            f"Ошибка обработки заявки: {e}"
         )
 
 
 # =========================================================
-# CAPTCHA INFO
+# CAPTCHA CALLBACK
 # =========================================================
 
 @dp.callback_query(
@@ -642,21 +681,17 @@ async def captcha_info(
     if callback.from_user.id != user_id:
 
         await callback.answer(
-            "❌ Это капча другого пользователя.",
+            "❌ Эта капча предназначена другому пользователю.",
             show_alert=True
         )
 
         return
 
     await callback.answer(
-        "Это твоя капча. Выбери правильный ответ ниже.",
+        "Это твоя капча. Выбери правильный ответ.",
         show_alert=True
     )
 
-
-# =========================================================
-# CAPTCHA
-# =========================================================
 
 @dp.callback_query(
     F.data.startswith("captcha:")
@@ -667,23 +702,21 @@ async def captcha_callback(
 
     try:
 
-        _, user_id, selected = (
-            callback.data.split(":")
-        )
+        parts = callback.data.split(":")
 
-        user_id = int(user_id)
-        selected = int(selected)
+        user_id = int(parts[1])
+        selected = int(parts[2])
 
     except Exception:
 
         await callback.answer(
-            "Ошибка капчи.",
+            "Ошибка.",
             show_alert=True
         )
 
         return
 
-    # Чужой пользователь
+    # Чужая капча
     if callback.from_user.id != user_id:
 
         await callback.answer(
@@ -711,15 +744,13 @@ async def captcha_callback(
     if not row:
 
         await callback.answer(
-            "Эта капча уже пройдена.",
+            "Капча уже пройдена.",
             show_alert=True
         )
 
         return
 
-    correct_answer = row["answer"]
-
-    if selected != correct_answer:
+    if selected != row["answer"]:
 
         await callback.answer(
             "❌ Неверно. Попробуй ещё раз.",
@@ -728,7 +759,7 @@ async def captcha_callback(
 
         return
 
-    # Удаляем пользователя из капч
+    # Удаляем капчу
     db.execute(
         """
         DELETE FROM captchas
@@ -744,13 +775,22 @@ async def captcha_callback(
     db.commit()
 
     # Разрешаем писать
-    await unrestrict_user(
-        chat_id,
-        user_id
-    )
+    try:
 
-    # Если это была последняя капча —
-    # удаляем общее сообщение
+        await bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            permissions=FULL_PERMISSIONS
+        )
+
+    except Exception as e:
+
+        logger.error(
+            f"Ошибка снятия мута после капчи: {e}"
+        )
+
+    # Если капч больше нет,
+    # удаляем общее сообщение.
     if not captcha_exists(chat_id):
 
         await delete_all_welcomes(
@@ -759,88 +799,22 @@ async def captcha_callback(
 
     else:
 
-        # Если остались другие пользователи,
-        # просто убираем кнопки конкретной капчи
-        # полностью пересоздать сообщение безопаснее:
+        # Оставшиеся капчи обновляем
         try:
 
-            rows = db.execute(
-                """
-                SELECT *
-                FROM captchas
-                WHERE chat_id = ?
-                ORDER BY created_at
-                """,
-                (chat_id,)
-            ).fetchall()
-
-            if rows:
-
-                text = (
-                    "👋 <b>Добро пожаловать в чат Stardew Valley!</b>\n\n"
+            text, keyboard = (
+                await build_current_captcha_message(
+                    chat_id
                 )
+            )
 
-                captcha_data = []
-
-                for row2 in rows:
-
-                    uid = row2["user_id"]
-
-                    try:
-
-                        member = await bot.get_chat_member(
-                            chat_id,
-                            uid
-                        )
-
-                        uname = member.user.full_name
-
-                    except Exception:
-
-                        uname = "Пользователь"
-
-                    text += (
-                        f"👤 {mention_user(uid, uname)}\n"
-                    )
-
-                    question = row2["question"]
-
-                    text += (
-                        f"🔐 Реши: <code>{question}</code>\n\n"
-                    )
-
-                    # Получаем варианты заново.
-                    # Правильный ответ обязательно сохраняем.
-                    answer = row2["answer"]
-
-                    options = {answer}
-
-                    while len(options) < 4:
-
-                        value = answer + random.randint(-5, 5)
-
-                        if value >= 0:
-                            options.add(value)
-
-                    options = list(options)
-                    random.shuffle(options)
-
-                    captcha_data.append(
-                        (uid, options)
-                    )
-
-                text += (
-                    "⚠️ Каждый участник может пройти "
-                    "только свою капчу."
-                )
+            if text:
 
                 await callback.message.edit_text(
-                    text,
+                    text=text,
                     parse_mode="HTML",
                     disable_web_page_preview=True,
-                    reply_markup=build_captcha_keyboard(
-                        captcha_data
-                    )
+                    reply_markup=keyboard
                 )
 
         except Exception as e:
@@ -855,71 +829,441 @@ async def captcha_callback(
 
 
 # =========================================================
-# MODERATOR
+# МОДЕРАЦИЯ
 # =========================================================
 
-async def is_moderator(
-    chat_id: int,
-    user_id: int
+async def get_replied_user(
+    message: Message
 ):
+
+    if not message.reply_to_message:
+        return None
+
+    return message.reply_to_message.from_user
+
+
+# =========================================================
+# /MUT
+# =========================================================
+
+@dp.message(
+    Command("mut")
+)
+async def mute_command(
+    message: Message
+):
+
+    # Команда только в группе
+    if message.chat.id != ALLOWED_CHAT_ID:
+        await delete_command(message)
+        return
+
+    # Только администратор
+    if not await is_admin(
+        message.chat.id,
+        message.from_user.id
+    ):
+
+        await delete_command(message)
+        return
+
+    # Обязательно ответом
+    target = await get_replied_user(
+        message
+    )
+
+    if not target:
+
+        await delete_command(message)
+
+        await message.answer(
+            "⚠️ Команду /mut нужно использовать "
+            "ответом на сообщение пользователя."
+        )
+
+        return
+
+    # Аргументы после /mut
+    args = message.text.split(maxsplit=1)
+
+    if len(args) < 2:
+
+        await delete_command(message)
+
+        await message.answer(
+            "⚠️ Формат:\n\n"
+            "<code>/mut причина 07.10.2026 09:00</code>",
+            parse_mode="HTML"
+        )
+
+        return
+
+    data = args[1].strip()
+
+    # Ищем дату и время в конце команды
+    match = re.search(
+        r"(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})\s*$",
+        data
+    )
+
+    if not match:
+
+        await delete_command(message)
+
+        await message.answer(
+            "⚠️ Не удалось определить дату.\n\n"
+            "Пример:\n"
+            "<code>/mut нарушение правил "
+            "07.10.2026 09:00</code>",
+            parse_mode="HTML"
+        )
+
+        return
+
+    date_text = match.group(1)
+    time_text = match.group(2)
+
+    reason = data[
+        :match.start()
+    ].strip()
+
+    if not reason:
+        reason = "нарушение правил группы"
+
+    # Парсим дату
+    try:
+
+        until = datetime.strptime(
+            f"{date_text} {time_text}",
+            "%d.%m.%Y %H:%M"
+        )
+
+        until_timestamp = until.timestamp()
+
+    except ValueError:
+
+        await delete_command(message)
+
+        await message.answer(
+            "⚠️ Неверная дата или время.",
+        )
+
+        return
+
+    now = time.time()
+
+    if until_timestamp <= now:
+
+        await delete_command(message)
+
+        await message.answer(
+            "⚠️ Дата окончания мута уже прошла."
+        )
+
+        return
+
+    # Нельзя мутить администратора
+    if await is_admin(
+        message.chat.id,
+        target.id
+    ):
+
+        await delete_command(message)
+
+        await message.answer(
+            "⚠️ Нельзя выдать мут администратору."
+        )
+
+        return
+
+    seconds = int(
+        until_timestamp - now
+    )
+
+    days = seconds // 86400
+    hours = seconds // 3600
+    remaining_seconds = seconds
+
+    # Telegram ограничивает срок мута,
+    # но здесь используем указанное пользователем время.
+    try:
+
+        await bot.restrict_chat_member(
+            chat_id=message.chat.id,
+            user_id=target.id,
+            permissions=BLOCKED_PERMISSIONS,
+            until_date=until
+        )
+
+    except Exception as e:
+
+        logger.error(
+            f"Ошибка мута: {e}"
+        )
+
+        await delete_command(message)
+
+        await message.answer(
+            "❌ Не удалось выдать ограничение.\n"
+            "Проверь права бота."
+        )
+
+        return
+
+    await delete_command(message)
+
+    target_name = (
+        f"@{target.username}"
+        if target.username
+        else target.full_name
+    )
+
+    mute_text = (
+        "🚫 <b>Пользователь "
+        f"{html.escape(target_name)} "
+        "получает ограничение</b>\n\n"
+        f"⏳ <b>Срок:</b> {days} дней "
+        f"({hours} часов / {remaining_seconds:,} секунд)\n"
+        f"📌 <b>Причина:</b> {html.escape(reason)}\n"
+        f"📜 <b>Правила:</b> "
+        f'<a href="{RULES_URL}">правила группы</a>'
+    )
+
+    await message.answer(
+        mute_text,
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+
+# =========================================================
+# /UNMUT
+# =========================================================
+
+@dp.message(
+    Command("unmut")
+)
+async def unmute_command(
+    message: Message
+):
+
+    if message.chat.id != ALLOWED_CHAT_ID:
+
+        await delete_command(message)
+        return
+
+    if not await is_admin(
+        message.chat.id,
+        message.from_user.id
+    ):
+
+        await delete_command(message)
+        return
+
+    target = await get_replied_user(
+        message
+    )
+
+    if not target:
+
+        await delete_command(message)
+
+        await message.answer(
+            "⚠️ Команду /unmut нужно использовать "
+            "ответом на сообщение пользователя."
+        )
+
+        return
 
     try:
 
-        member = await bot.get_chat_member(
-            chat_id,
-            user_id
+        await bot.restrict_chat_member(
+            chat_id=message.chat.id,
+            user_id=target.id,
+            permissions=FULL_PERMISSIONS
         )
 
-        return member.status in {
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.CREATOR
-        }
+    except Exception as e:
 
-    except Exception:
+        logger.error(
+            f"Ошибка снятия мута: {e}"
+        )
 
-        return False
+        await delete_command(message)
 
+        await message.answer(
+            "❌ Не удалось снять ограничение."
+        )
 
-# =========================================================
-# /PING
-# =========================================================
-
-@dp.message(Command("ping"))
-async def ping(
-    message: Message
-):
-
-    if message.chat.id != ALLOWED_CHAT_ID:
         return
 
+    await delete_command(message)
+
+    target_name = (
+        f"@{target.username}"
+        if target.username
+        else target.full_name
+    )
+
     await message.answer(
-        "🟢 <b>Stardew Bot работает!</b>\n\n"
-        "Бот подключён к этой группе.",
+        "✅ <b>Ограничение снято</b>\n\n"
+        f"👤 Пользователь: "
+        f"{html.escape(target_name)}\n"
+        "Теперь пользователь снова может писать в чат.",
         parse_mode="HTML"
     )
 
 
 # =========================================================
-# /ID
+# /BAN
 # =========================================================
 
-@dp.message(Command("id"))
-async def chat_id_command(
+@dp.message(
+    Command("ban")
+)
+async def ban_command(
     message: Message
 ):
 
     if message.chat.id != ALLOWED_CHAT_ID:
+
+        await delete_command(message)
         return
 
+    if not await is_admin(
+        message.chat.id,
+        message.from_user.id
+    ):
+
+        await delete_command(message)
+        return
+
+    target = await get_replied_user(
+        message
+    )
+
+    if not target:
+
+        await delete_command(message)
+
+        await message.answer(
+            "⚠️ Команду /ban нужно использовать "
+            "ответом на сообщение пользователя."
+        )
+
+        return
+
+    # Нельзя банить администратора
+    if await is_admin(
+        message.chat.id,
+        target.id
+    ):
+
+        await delete_command(message)
+
+        await message.answer(
+            "⚠️ Нельзя заблокировать администратора."
+        )
+
+        return
+
+    try:
+
+        await bot.ban_chat_member(
+            chat_id=message.chat.id,
+            user_id=target.id
+        )
+
+    except Exception as e:
+
+        logger.error(
+            f"Ошибка бана: {e}"
+        )
+
+        await delete_command(message)
+
+        await message.answer(
+            "❌ Не удалось заблокировать пользователя."
+        )
+
+        return
+
+    await delete_command(message)
+
+    target_name = (
+        f"@{target.username}"
+        if target.username
+        else target.full_name
+    )
+
     await message.answer(
-        f"🆔 ID группы:\n<code>{message.chat.id}</code>",
+        "🔨 <b>Пользователь удалён из группы</b>\n\n"
+        f"👤 {html.escape(target_name)}\n"
+        "🚫 Доступ к группе заблокирован.",
         parse_mode="HTML"
     )
 
 
 # =========================================================
-# GAME KEYBOARD
+# /RULES
 # =========================================================
+
+@dp.message(
+    Command("rules")
+)
+async def rules_command(
+    message: Message
+):
+
+    if message.chat.id != ALLOWED_CHAT_ID:
+
+        await delete_command(message)
+        return
+
+    # Команду удаляем у всех,
+    # но правила может вызвать любой пользователь.
+    await delete_command(message)
+
+    await message.answer(
+        "📜 <b>Правила группы Stardew Valley</b>\n\n"
+        f'🔗 Полные правила: '
+        f'<a href="{RULES_URL}">ссылка</a>\n\n'
+        "⚠️ Незнание правил не освобождает "
+        "от ответственности.",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+
+# =========================================================
+# /PLAY
+# =========================================================
+
+def waiting_game_keyboard(
+    message_id: int
+):
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎮 Войти в игру",
+                    callback_data=(
+                        f"game:join:{message_id}"
+                    )
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗑 Удалить",
+                    callback_data=(
+                        f"game:delete:{message_id}"
+                    )
+                )
+            ]
+        ]
+    )
+
 
 def game_keyboard(
     game: Game
@@ -971,47 +1315,15 @@ def game_keyboard(
     )
 
 
-def waiting_game_keyboard(
-    message_id: int
-):
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎮 Войти в игру",
-                    callback_data=(
-                        f"game:join:{message_id}"
-                    )
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🗑 Удалить",
-                    callback_data=(
-                        f"game:delete:{message_id}"
-                    )
-                )
-            ]
-        ]
-    )
-
-
-# =========================================================
-# GAME RESULT
-# =========================================================
-
 def check_winner(board):
 
     combinations = [
         (0, 1, 2),
         (3, 4, 5),
         (6, 7, 8),
-
         (0, 3, 6),
         (1, 4, 7),
         (2, 5, 8),
-
         (0, 4, 8),
         (2, 4, 6)
     ]
@@ -1045,10 +1357,6 @@ def player_symbol(
     return None
 
 
-# =========================================================
-# GAME TIMER
-# =========================================================
-
 async def game_timer(
     game: Game
 ):
@@ -1064,7 +1372,9 @@ async def game_timer(
                 time.time() - game.created_at
             )
 
-            remaining = GAME_WAIT_SECONDS - elapsed
+            remaining = (
+                GAME_WAIT_SECONDS - elapsed
+            )
 
             if remaining <= 0:
 
@@ -1073,30 +1383,35 @@ async def game_timer(
                     None
                 )
 
-                await bot.edit_message_text(
-                    chat_id=game.chat_id,
-                    message_id=game.message_id,
-                    text=(
-                        "🎮 <b>КРЕСТИКИ-НОЛИКИ</b>\n\n"
-                        f"👤 {mention_user(game.creator_id, game.creator_name)}\n\n"
-                        "⌛ Время ожидания второго игрока "
-                        "<b>истекло</b>."
-                    ),
-                    parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [
-                                InlineKeyboardButton(
-                                    text="🗑 Удалить",
-                                    callback_data=(
-                                        f"game:delete:"
-                                        f"{game.message_id}"
+                try:
+
+                    await bot.edit_message_text(
+                        chat_id=game.chat_id,
+                        message_id=game.message_id,
+                        text=(
+                            "🎮 <b>КРЕСТИКИ-НОЛИКИ</b>\n\n"
+                            f"👤 {mention_user(game.creator_id, game.creator_name)}\n\n"
+                            "⌛ Время ожидания второго "
+                            "<b>игрока истекло.</b>"
+                        ),
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup(
+                            inline_keyboard=[
+                                [
+                                    InlineKeyboardButton(
+                                        text="🗑 Удалить",
+                                        callback_data=(
+                                            f"game:delete:"
+                                            f"{game.message_id}"
+                                        )
                                     )
-                                )
+                                ]
                             ]
-                        ]
+                        )
                     )
-                )
+
+                except Exception:
+                    pass
 
                 return
 
@@ -1113,7 +1428,7 @@ async def game_timer(
                     text=(
                         "🎮 <b>КРЕСТИКИ-НОЛИКИ</b>\n\n"
                         f"👤 {mention_user(game.creator_id, game.creator_name)}\n\n"
-                        f"⏳ Ищем второго игрока...\n"
+                        "⏳ Ищем второго игрока...\n"
                         f"Осталось: <b>{timer}</b>"
                     ),
                     parse_mode="HTML",
@@ -1131,11 +1446,9 @@ async def game_timer(
         return
 
 
-# =========================================================
-# /PLAY
-# =========================================================
-
-@dp.message(Command("play"))
+@dp.message(
+    Command("play")
+)
 async def play_command(
     message: Message
 ):
@@ -1168,7 +1481,9 @@ async def play_command(
         )
     )
 
-    games[game.message_id] = game
+    games[
+        game.message_id
+    ] = game
 
     game_timer_tasks[
         game.message_id
@@ -1240,14 +1555,13 @@ async def game_join(
     game.started = True
     game.turn = 1
 
-    # Останавливаем таймер ожидания
+    # Останавливаем таймер
     timer_task = game_timer_tasks.pop(
         message_id,
         None
     )
 
     if timer_task:
-
         timer_task.cancel()
 
     try:
@@ -1268,7 +1582,7 @@ async def game_join(
         )
 
         await callback.answer(
-            "Не удалось запустить игру. Попробуй ещё раз.",
+            "❌ Не удалось начать игру.",
             show_alert=True
         )
 
@@ -1319,15 +1633,6 @@ async def game_move(
 
         return
 
-    if not game.started:
-
-        await callback.answer(
-            "Ждём второго игрока.",
-            show_alert=True
-        )
-
-        return
-
     symbol = player_symbol(
         game,
         callback.from_user.id
@@ -1360,7 +1665,7 @@ async def game_move(
     if game.board[cell]:
 
         await callback.answer(
-            "Эта клетка занята.",
+            "Эта клетка уже занята.",
             show_alert=True
         )
 
@@ -1419,13 +1724,10 @@ async def game_move(
         )
 
         await callback.answer()
-
         return
 
     game.turn = (
-        2
-        if game.turn == 1
-        else 1
+        2 if game.turn == 1 else 1
     )
 
     next_symbol = (
@@ -1445,10 +1747,6 @@ async def game_move(
 
     await callback.answer()
 
-
-# =========================================================
-# USED CELL
-# =========================================================
 
 @dp.callback_query(
     F.data == "game:used"
@@ -1495,7 +1793,7 @@ async def delete_game(
 
         allowed = (
             callback.from_user.id == game.creator_id
-            or await is_moderator(
+            or await is_admin(
                 game.chat_id,
                 callback.from_user.id
             )
@@ -1505,7 +1803,7 @@ async def delete_game(
 
             await callback.answer(
                 "❌ Удалить может создатель "
-                "или модератор.",
+                "или администратор.",
                 show_alert=True
             )
 
@@ -1518,13 +1816,13 @@ async def delete_game(
 
     else:
 
-        if not await is_moderator(
+        if not await is_admin(
             callback.message.chat.id,
             callback.from_user.id
         ):
 
             await callback.answer(
-                "❌ Удалить может только модератор.",
+                "❌ Удалить может только администратор.",
                 show_alert=True
             )
 
@@ -1539,9 +1837,7 @@ async def delete_game(
         timer_task.cancel()
 
     try:
-
         await callback.message.delete()
-
     except Exception:
         pass
 
@@ -1593,34 +1889,15 @@ DROP_WEATHER = [
 
 def generate_drop():
 
-    season = random.choice(
-        DROP_SEASONS
-    )
-
-    location = random.choice(
-        DROP_LOCATIONS
-    )
-
-    item = random.choice(
-        DROP_ITEMS
-    )
-
-    weather = random.choice(
-        DROP_WEATHER
-    )
-
-    luck = random.randint(
-        1,
-        100
-    )
-
     return (
         "💧 <b>КАПЛЯ STARDEW</b>\n\n"
-        f"{season}\n"
-        f"{weather}\n"
-        f"{location}\n\n"
-        f"🎁 Находка: <b>{item}</b>\n"
-        f"🍀 Удача: <b>{luck}%</b>\n\n"
+        f"{random.choice(DROP_SEASONS)}\n"
+        f"{random.choice(DROP_WEATHER)}\n"
+        f"{random.choice(DROP_LOCATIONS)}\n\n"
+        f"🎁 Находка: "
+        f"<b>{random.choice(DROP_ITEMS)}</b>\n"
+        f"🍀 Удача: "
+        f"<b>{random.randint(1, 100)}%</b>\n\n"
         "Нажми кнопку для новой комбинации."
     )
 
@@ -1639,7 +1916,9 @@ def drop_keyboard():
     )
 
 
-@dp.message(Command("drop"))
+@dp.message(
+    Command("drop")
+)
 async def drop_command(
     message: Message
 ):
@@ -1676,6 +1955,48 @@ async def new_drop(
 
 
 # =========================================================
+# /PING
+# =========================================================
+
+@dp.message(
+    Command("ping")
+)
+async def ping(
+    message: Message
+):
+
+    if message.chat.id != ALLOWED_CHAT_ID:
+        return
+
+    await message.answer(
+        "🟢 <b>Stardew Bot работает!</b>\n\n"
+        "Бот подключён к этой группе.",
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# /ID
+# =========================================================
+
+@dp.message(
+    Command("id")
+)
+async def chat_id_command(
+    message: Message
+):
+
+    if message.chat.id != ALLOWED_CHAT_ID:
+        return
+
+    await message.answer(
+        f"🆔 ID группы:\n"
+        f"<code>{message.chat.id}</code>",
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
 # ЛИЧНЫЕ СООБЩЕНИЯ
 # =========================================================
 
@@ -1686,18 +2007,18 @@ async def private_messages(
     message: Message
 ):
 
-    # Бот полностью игнорирует личные сообщения.
+    # Бот не отвечает в личке.
     return
 
 
 # =========================================================
-# START
+# ЗАПУСК
 # =========================================================
 
 async def main():
 
     logger.info(
-        "Запуск Stardew Bot..."
+        "Запуск Stardew Valley Bot..."
     )
 
     me = await bot.get_me()
@@ -1710,8 +2031,7 @@ async def main():
         f"Группа: {ALLOWED_CHAT_ID}"
     )
 
-    # Убираем старый webhook,
-    # если он когда-либо использовался.
+    # На случай старого webhook
     await bot.delete_webhook(
         drop_pending_updates=False
     )
@@ -1725,6 +2045,10 @@ async def main():
         ]
     )
 
+
+# =========================================================
+# MAIN
+# =========================================================
 
 if __name__ == "__main__":
 
