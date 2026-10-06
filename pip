@@ -1,0 +1,1455 @@
+import asyncio
+import logging
+import random
+import sqlite3
+import time
+from datetime import datetime
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ChatType
+from aiogram.filters import Command
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    ChatJoinRequest,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ChatPermissions,
+)
+from aiogram.exceptions import TelegramBadRequest
+
+
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
+
+BOT_TOKEN = "ВСТАВЬ_СЮДА_ТОКЕН_БОТА"
+
+# Можно указать ID группы.
+# Если оставить 0, бот будет работать во всех группах,
+# где он является администратором.
+ALLOWED_CHAT_ID = 0
+
+RULES_URL = "https://t.me/stardewrus_chat/1255258"
+
+# Сколько ждём второго игрока
+GAME_WAIT_SECONDS = 180
+
+# Как часто обновлять таймер ожидания
+TIMER_UPDATE_SECONDS = 5
+
+
+# ============================================================
+# ЛОГИ
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# БОТ
+# ============================================================
+
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+
+
+# ============================================================
+# SQLITE
+# ============================================================
+
+db = sqlite3.connect(
+    "stardew_bot.sqlite3",
+    check_same_thread=False
+)
+
+db.row_factory = sqlite3.Row
+
+cursor = db.cursor()
+
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS captchas (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    message_id INTEGER,
+    question TEXT NOT NULL,
+    correct_answer TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, user_id)
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS welcome_messages (
+    chat_id INTEGER PRIMARY KEY,
+    message_id INTEGER NOT NULL
+)
+""")
+
+db.commit()
+
+
+# ============================================================
+# ИГРЫ
+# ============================================================
+
+games = {}
+
+# Формат:
+#
+# games[message_id] = {
+#     "chat_id": ...,
+#     "creator_id": ...,
+#     "creator_name": ...,
+#     "player2_id": None,
+#     "player2_name": None,
+#     "board": ["", "", ...],
+#     "turn": user_id,
+#     "started": False,
+#     "created_at": timestamp
+# }
+
+
+# ============================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
+
+def allowed_chat(chat_id: int) -> bool:
+    if ALLOWED_CHAT_ID == 0:
+        return True
+
+    return chat_id == ALLOWED_CHAT_ID
+
+
+def mention_user(user_id: int, name: str) -> str:
+    safe_name = name.replace("<", "").replace(">", "")
+
+    return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
+
+
+def get_display_name(user) -> str:
+    if user.username:
+        return f"@{user.username}"
+
+    return user.full_name
+
+
+def is_admin(member) -> bool:
+    return member.status in ("administrator", "creator")
+
+
+# ============================================================
+# PERMISSIONS
+# ============================================================
+
+# Полный запрет обычному участнику писать.
+# Пользователь при этом остаётся в группе.
+NO_PERMISSIONS = ChatPermissions(
+    can_send_messages=False,
+    can_send_audios=False,
+    can_send_documents=False,
+    can_send_photos=False,
+    can_send_videos=False,
+    can_send_video_notes=False,
+    can_send_voice_notes=False,
+    can_send_polls=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False,
+)
+
+
+# Возвращаем обычные возможности участника.
+NORMAL_PERMISSIONS = ChatPermissions(
+    can_send_messages=True,
+    can_send_audios=True,
+    can_send_documents=True,
+    can_send_photos=True,
+    can_send_videos=True,
+    can_send_video_notes=True,
+    can_send_voice_notes=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+)
+
+
+async def restrict_user(chat_id: int, user_id: int):
+    try:
+        await bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            permissions=NO_PERMISSIONS
+        )
+
+    except TelegramBadRequest as e:
+        logger.warning(
+            "Не удалось ограничить %s: %s",
+            user_id,
+            e
+        )
+
+
+async def unrestrict_user(chat_id: int, user_id: int):
+    try:
+        await bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            permissions=NORMAL_PERMISSIONS
+        )
+
+    except TelegramBadRequest as e:
+        logger.warning(
+            "Не удалось снять ограничение %s: %s",
+            user_id,
+            e
+        )
+
+
+# ============================================================
+# ПРОВЕРКА: ЕСТЬ ЛИ НЕПРОЙДЕННЫЕ КАПЧИ
+# ============================================================
+
+def has_active_captchas(chat_id: int) -> bool:
+    row = cursor.execute(
+        """
+        SELECT 1
+        FROM captchas
+        WHERE chat_id = ?
+        LIMIT 1
+        """,
+        (chat_id,)
+    ).fetchone()
+
+    return row is not None
+
+
+# ============================================================
+# УДАЛЕНИЕ СТАРОГО ПРИВЕТСТВИЯ
+# ============================================================
+
+async def delete_old_welcome_if_possible(chat_id: int):
+    """
+    Если незавершённых капч нет — удаляем старое приветствие.
+    Если капча есть — старое сообщение не трогаем.
+    """
+
+    if has_active_captchas(chat_id):
+        return
+
+    row = cursor.execute(
+        """
+        SELECT message_id
+        FROM welcome_messages
+        WHERE chat_id = ?
+        """,
+        (chat_id,)
+    ).fetchone()
+
+    if not row:
+        return
+
+    message_id = row["message_id"]
+
+    try:
+        await bot.delete_message(
+            chat_id=chat_id,
+            message_id=message_id
+        )
+    except TelegramBadRequest:
+        pass
+
+    cursor.execute(
+        "DELETE FROM welcome_messages WHERE chat_id = ?",
+        (chat_id,)
+    )
+
+    db.commit()
+
+
+# ============================================================
+# КАПЧА
+# ============================================================
+
+def create_captcha():
+
+    operations = [
+        ("2 + 3", 5),
+        ("4 + 4", 8),
+        ("7 - 3", 4),
+        ("5 + 6", 11),
+        ("9 - 4", 5),
+        ("3 × 3", 9),
+        ("6 + 7", 13),
+        ("10 - 6", 4),
+        ("8 + 5", 13),
+        ("12 - 7", 5),
+    ]
+
+    question, correct = random.choice(operations)
+
+    answers = {correct}
+
+    while len(answers) < 4:
+        offset = random.randint(-5, 5)
+
+        if offset == 0:
+            continue
+
+        value = correct + offset
+
+        if value > 0:
+            answers.add(value)
+
+    answers = list(answers)
+    random.shuffle(answers)
+
+    return question, correct, answers
+
+
+def captcha_keyboard(
+    chat_id: int,
+    user_id: int,
+    answers
+):
+    rows = []
+
+    row = []
+
+    for answer in answers:
+
+        row.append(
+            InlineKeyboardButton(
+                text=str(answer),
+                callback_data=f"captcha:{chat_id}:{user_id}:{answer}"
+            )
+        )
+
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+
+    if row:
+        rows.append(row)
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+async def send_captcha(
+    chat_id: int,
+    user
+):
+    question, correct, answers = create_captcha()
+
+    text = (
+        f"🧩 <b>Проверка</b>\n\n"
+        f"{mention_user(user.id, user.full_name)}, "
+        f"решите пример:\n\n"
+        f"<b>{question} = ?</b>\n\n"
+        f"⚠️ Пока вы не пройдёте проверку, писать сообщения в чат нельзя.\n"
+        f"Эта капча предназначена только для вас."
+    )
+
+    message = await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=captcha_keyboard(
+            chat_id,
+            user.id,
+            answers
+        )
+    )
+
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO captchas
+        (chat_id, user_id, message_id, question, correct_answer, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            chat_id,
+            user.id,
+            message.message_id,
+            question,
+            str(correct),
+            int(time.time())
+        )
+    )
+
+    db.commit()
+
+
+# ============================================================
+# ПРИЁМ ЗАЯВОК
+# ============================================================
+
+welcome_queue = {}
+
+
+async def process_welcome_queue(chat_id: int):
+    await asyncio.sleep(1)
+
+    users = welcome_queue.pop(chat_id, [])
+
+    if not users:
+        return
+
+    # Не удаляем старое приветствие,
+    # если есть незавершённая капча.
+    if not has_active_captchas(chat_id):
+
+        row = cursor.execute(
+            """
+            SELECT message_id
+            FROM welcome_messages
+            WHERE chat_id = ?
+            """,
+            (chat_id,)
+        ).fetchone()
+
+        if row:
+
+            try:
+                await bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=row["message_id"]
+                )
+            except TelegramBadRequest:
+                pass
+
+    names = []
+
+    for user in users:
+        names.append(
+            mention_user(
+                user.id,
+                user.full_name
+            )
+        )
+
+    text = (
+        "👋 <b>Добро пожаловать в чат Stardrew Valley!</b>\n\n"
+        + "\n".join(names)
+        + "\n\n"
+        f"📖 <b>Правила</b> — {RULES_URL}"
+    )
+
+    message = await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        disable_web_page_preview=True
+    )
+
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO welcome_messages
+        (chat_id, message_id)
+        VALUES (?, ?)
+        """,
+        (
+            chat_id,
+            message.message_id
+        )
+    )
+
+    db.commit()
+
+
+@dp.chat_join_request()
+async def join_request_handler(
+    request: ChatJoinRequest
+):
+    chat_id = request.chat.id
+    user = request.from_user
+
+    if not allowed_chat(chat_id):
+        return
+
+    try:
+        # Сначала принимаем заявку.
+        await request.approve()
+
+        # После принятия сразу запрещаем писать.
+        await restrict_user(
+            chat_id,
+            user.id
+        )
+
+        # Создаём капчу.
+        await send_captcha(
+            chat_id,
+            user
+        )
+
+        # Добавляем пользователя в очередь приветствия.
+        if chat_id not in welcome_queue:
+            welcome_queue[chat_id] = []
+
+            asyncio.create_task(
+                process_welcome_queue(chat_id)
+            )
+
+        welcome_queue[chat_id].append(user)
+
+        logger.info(
+            "Принята заявка: %s (%s)",
+            user.full_name,
+            user.id
+        )
+
+    except Exception as e:
+        logger.exception(
+            "Ошибка при обработке заявки: %s",
+            e
+        )
+
+
+# ============================================================
+# КАПЧА — НАЖАТИЕ КНОПКИ
+# ============================================================
+
+@dp.callback_query(F.data.startswith("captcha:"))
+async def captcha_callback(
+    callback: CallbackQuery
+):
+    try:
+        _, chat_id, user_id, answer = callback.data.split(":")
+
+        chat_id = int(chat_id)
+        user_id = int(user_id)
+        answer = int(answer)
+
+    except Exception:
+        await callback.answer(
+            "Ошибка капчи.",
+            show_alert=True
+        )
+        return
+
+    # Чужую капчу нажать нельзя.
+    if callback.from_user.id != user_id:
+
+        await callback.answer(
+            "❌ Это не ваша капча.",
+            show_alert=True
+        )
+
+        return
+
+    row = cursor.execute(
+        """
+        SELECT *
+        FROM captchas
+        WHERE chat_id = ?
+        AND user_id = ?
+        """,
+        (
+            chat_id,
+            user_id
+        )
+    ).fetchone()
+
+    if not row:
+
+        await callback.answer(
+            "Эта капча уже завершена.",
+            show_alert=True
+        )
+
+        return
+
+    correct_answer = int(
+        row["correct_answer"]
+    )
+
+    if answer != correct_answer:
+
+        await callback.answer(
+            "❌ Неверно. Попробуйте ещё раз.",
+            show_alert=True
+        )
+
+        return
+
+    # Удаляем капчу из БД.
+    cursor.execute(
+        """
+        DELETE FROM captchas
+        WHERE chat_id = ?
+        AND user_id = ?
+        """,
+        (
+            chat_id,
+            user_id
+        )
+    )
+
+    db.commit()
+
+    # Снимаем ограничение.
+    await unrestrict_user(
+        chat_id,
+        user_id
+    )
+
+    try:
+        await callback.message.edit_text(
+            "✅ <b>Проверка пройдена!</b>\n\n"
+            f"{mention_user(callback.from_user.id, callback.from_user.full_name)}, "
+            "теперь вы можете писать в чат."
+        )
+
+    except TelegramBadRequest:
+        pass
+
+    await callback.answer(
+        "✅ Готово!"
+    )
+
+    # Если капч больше нет — удаляем приветствие.
+    await delete_old_welcome_if_possible(
+        chat_id
+    )
+
+
+# ============================================================
+# /START В ЛИЧКЕ
+# ============================================================
+
+@dp.message(
+    F.chat.type == ChatType.PRIVATE
+)
+async def private_messages(
+    message: Message
+):
+    # Ничего не отвечаем.
+    # Бот предназначен для настройки и работы в группе.
+    return
+
+
+# ============================================================
+# ПРОВЕРКА МОДЕРАТОРА
+# ============================================================
+
+async def user_is_moderator(
+    chat_id: int,
+    user_id: int
+) -> bool:
+
+    try:
+        member = await bot.get_chat_member(
+            chat_id,
+            user_id
+        )
+
+        return member.status in (
+            "administrator",
+            "creator"
+        )
+
+    except Exception:
+        return False
+
+
+# ============================================================
+# КРЕСТИКИ-НОЛИКИ
+# ============================================================
+
+def game_keyboard(
+    board,
+    game_message_id
+):
+
+    buttons = []
+
+    for index in range(9):
+
+        value = board[index]
+
+        if value == "":
+            text = "·"
+        else:
+            text = value
+
+        buttons.append(
+            InlineKeyboardButton(
+                text=text,
+                callback_data=f"ttt:{game_message_id}:{index}"
+            )
+        )
+
+    rows = [
+        buttons[0:3],
+        buttons[3:6],
+        buttons[6:9]
+    ]
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔴 Удалить",
+                callback_data=f"ttt_delete:{game_message_id}"
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+def check_winner(board):
+
+    combinations = [
+        (0, 1, 2),
+        (3, 4, 5),
+        (6, 7, 8),
+
+        (0, 3, 6),
+        (1, 4, 7),
+        (2, 5, 8),
+
+        (0, 4, 8),
+        (2, 4, 6)
+    ]
+
+    for a, b, c in combinations:
+
+        if (
+            board[a]
+            and board[a] == board[b]
+            and board[a] == board[c]
+        ):
+            return board[a]
+
+    if all(board):
+        return "draw"
+
+    return None
+
+
+def render_board(board):
+
+    symbols = []
+
+    for value in board:
+
+        if value == "❌":
+            symbols.append("❌")
+
+        elif value == "⭕":
+            symbols.append("⭕")
+
+        else:
+            symbols.append("▫️")
+
+    return (
+        f"{symbols[0]} {symbols[1]} {symbols[2]}\n"
+        f"{symbols[3]} {symbols[4]} {symbols[5]}\n"
+        f"{symbols[6]} {symbols[7]} {symbols[8]}"
+    )
+
+
+async def delete_game_message(
+    chat_id,
+    message_id
+):
+
+    try:
+        await bot.delete_message(
+            chat_id=chat_id,
+            message_id=message_id
+        )
+    except TelegramBadRequest:
+        pass
+
+    games.pop(
+        message_id,
+        None
+    )
+
+
+async def game_timer(
+    chat_id,
+    message_id
+):
+
+    while True:
+
+        await asyncio.sleep(
+            TIMER_UPDATE_SECONDS
+        )
+
+        game = games.get(
+            message_id
+        )
+
+        if not game:
+            return
+
+        if game["started"]:
+            return
+
+        elapsed = int(
+            time.time() - game["created_at"]
+        )
+
+        remaining = GAME_WAIT_SECONDS - elapsed
+
+        if remaining <= 0:
+
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=(
+                        "🎮 <b>Крестики-нолики</b>\n\n"
+                        "⌛ Время ожидания второго игрока "
+                        "закончилось.\n\n"
+                        "Игра удалена."
+                    )
+                )
+
+                await asyncio.sleep(2)
+
+                await delete_game_message(
+                    chat_id,
+                    message_id
+                )
+
+            except TelegramBadRequest:
+                await delete_game_message(
+                    chat_id,
+                    message_id
+                )
+
+            return
+
+        minutes = remaining // 60
+        seconds = remaining % 60
+
+        try:
+
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=(
+                    "🎮 <b>Крестики-нолики</b>\n\n"
+                    f"👤 Создатель: "
+                    f"{mention_user(game['creator_id'], game['creator_name'])}\n\n"
+                    "🕹️ Ищем второго игрока...\n\n"
+                    f"⏱ Осталось: "
+                    f"<b>{minutes}:{seconds:02d}</b>"
+                ),
+                reply_markup=game_keyboard(
+                    game["board"],
+                    message_id
+                )
+            )
+
+        except TelegramBadRequest:
+            return
+
+
+@dp.message(
+    Command("play"),
+    F.chat.type.in_({
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    })
+)
+async def play_command(
+    message: Message
+):
+
+    chat_id = message.chat.id
+
+    if not allowed_chat(chat_id):
+        return
+
+    user = message.from_user
+
+    text = (
+        "🎮 <b>Крестики-нолики</b>\n\n"
+        f"👤 Создатель: "
+        f"{mention_user(user.id, user.full_name)}\n\n"
+        "🕹️ Ищем второго игрока...\n\n"
+        "Нажмите кнопку ниже, чтобы присоединиться.\n\n"
+        "⏱ Время ожидания: <b>3:00</b>"
+    )
+
+    sent = await message.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🕹️ Играть",
+                        callback_data="ttt_join"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🔴 Удалить",
+                        callback_data="ttt_delete_pending"
+                    )
+                ]
+            ]
+        )
+    )
+
+    games[sent.message_id] = {
+        "chat_id": chat_id,
+        "creator_id": user.id,
+        "creator_name": user.full_name,
+        "player2_id": None,
+        "player2_name": None,
+        "board": [""] * 9,
+        "turn": user.id,
+        "started": False,
+        "created_at": time.time()
+    }
+
+    # Удаляем команду пользователя.
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+    asyncio.create_task(
+        game_timer(
+            chat_id,
+            sent.message_id
+        )
+    )
+
+
+# ============================================================
+# ПРИСОЕДИНЕНИЕ К ИГРЕ
+# ============================================================
+
+@dp.callback_query(
+    F.data == "ttt_join"
+)
+async def join_game(
+    callback: CallbackQuery
+):
+
+    # Ищем игру по message_id.
+    message_id = callback.message.message_id
+
+    game = games.get(
+        message_id
+    )
+
+    if not game:
+
+        await callback.answer(
+            "Игра уже закончилась.",
+            show_alert=True
+        )
+
+        return
+
+    user = callback.from_user
+
+    if user.id == game["creator_id"]:
+
+        await callback.answer(
+            "Вы уже создатель этой игры.",
+            show_alert=True
+        )
+
+        return
+
+    if game["player2_id"] is not None:
+
+        await callback.answer(
+            "В игре уже есть два игрока.",
+            show_alert=True
+        )
+
+        return
+
+    game["player2_id"] = user.id
+    game["player2_name"] = user.full_name
+    game["started"] = True
+
+    # Создатель начинает ❌
+    game["turn"] = game["creator_id"]
+
+    await callback.message.edit_text(
+        "🎮 <b>Крестики-нолики</b>\n\n"
+        f"❌ {mention_user(game['creator_id'], game['creator_name'])}\n"
+        f"⭕ {mention_user(game['player2_id'], game['player2_name'])}\n\n"
+        "Игра началась!\n\n"
+        f"{render_board(game['board'])}\n\n"
+        f"Ход: ❌ "
+        f"{mention_user(game['creator_id'], game['creator_name'])}",
+        reply_markup=game_keyboard(
+            game["board"],
+            message_id
+        )
+    )
+
+    await callback.answer(
+        "Вы присоединились к игре!"
+    )
+
+
+# ============================================================
+# ХОД
+# ============================================================
+
+@dp.callback_query(
+    F.data.startswith("ttt:")
+)
+async def ttt_move(
+    callback: CallbackQuery
+):
+
+    try:
+
+        _, message_id, index = callback.data.split(":")
+
+        message_id = int(message_id)
+        index = int(index)
+
+    except Exception:
+
+        await callback.answer(
+            "Ошибка.",
+            show_alert=True
+        )
+
+        return
+
+    game = games.get(
+        message_id
+    )
+
+    if not game:
+
+        await callback.answer(
+            "Игра закончилась.",
+            show_alert=True
+        )
+
+        return
+
+    if not game["started"]:
+
+        await callback.answer(
+            "Сначала нужен второй игрок.",
+            show_alert=True
+        )
+
+        return
+
+    user_id = callback.from_user.id
+
+    if user_id != game["turn"]:
+
+        await callback.answer(
+            "Сейчас ход другого игрока.",
+            show_alert=True
+        )
+
+        return
+
+    if game["board"][index] != "":
+
+        await callback.answer(
+            "Эта клетка уже занята.",
+            show_alert=True
+        )
+
+        return
+
+    if user_id == game["creator_id"]:
+        symbol = "❌"
+        next_player = game["player2_id"]
+    else:
+        symbol = "⭕"
+        next_player = game["creator_id"]
+
+    game["board"][index] = symbol
+    game["turn"] = next_player
+
+    winner = check_winner(
+        game["board"]
+    )
+
+    if winner:
+
+        if winner == "draw":
+            result = "🤝 Ничья!"
+        elif winner == "❌":
+            result = (
+                "🏆 Победил "
+                + mention_user(
+                    game["creator_id"],
+                    game["creator_name"]
+                )
+                + "!"
+            )
+        else:
+            result = (
+                "🏆 Победил "
+                + mention_user(
+                    game["player2_id"],
+                    game["player2_name"]
+                )
+                + "!"
+            )
+
+        await callback.message.edit_text(
+            "🎮 <b>Крестики-нолики</b>\n\n"
+            f"{render_board(game['board'])}\n\n"
+            f"{result}",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🔴 Удалить",
+                            callback_data=f"ttt_delete:{message_id}"
+                        )
+                    ]
+                ]
+            )
+        )
+
+        await callback.answer(
+            "Игра окончена!"
+        )
+
+        return
+
+    next_symbol = (
+        "❌"
+        if game["turn"] == game["creator_id"]
+        else "⭕"
+    )
+
+    next_name = (
+        game["creator_name"]
+        if game["turn"] == game["creator_id"]
+        else game["player2_name"]
+    )
+
+    await callback.message.edit_text(
+        "🎮 <b>Крестики-нолики</b>\n\n"
+        f"❌ {mention_user(game['creator_id'], game['creator_name'])}\n"
+        f"⭕ {mention_user(game['player2_id'], game['player2_name'])}\n\n"
+        f"{render_board(game['board'])}\n\n"
+        f"Ход: {next_symbol} "
+        f"{mention_user(game['turn'], next_name)}",
+        reply_markup=game_keyboard(
+            game["board"],
+            message_id
+        )
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# УДАЛЕНИЕ ИГРЫ
+# ============================================================
+
+@dp.callback_query(
+    F.data == "ttt_delete_pending"
+)
+async def delete_pending_game(
+    callback: CallbackQuery
+):
+
+    message_id = callback.message.message_id
+
+    game = games.get(
+        message_id
+    )
+
+    if not game:
+
+        await callback.answer(
+            "Игра уже удалена.",
+            show_alert=True
+        )
+
+        return
+
+    user_id = callback.from_user.id
+
+    allowed = (
+        user_id == game["creator_id"]
+        or await user_is_moderator(
+            game["chat_id"],
+            user_id
+        )
+    )
+
+    if not allowed:
+
+        await callback.answer(
+            "Удалить игру может создатель или модератор.",
+            show_alert=True
+        )
+
+        return
+
+    await delete_game_message(
+        game["chat_id"],
+        message_id
+    )
+
+    await callback.answer(
+        "Игра удалена."
+    )
+
+
+@dp.callback_query(
+    F.data.startswith("ttt_delete:")
+)
+async def delete_game(
+    callback: CallbackQuery
+):
+
+    try:
+        _, message_id = callback.data.split(":")
+
+        message_id = int(message_id)
+
+    except Exception:
+
+        await callback.answer(
+            "Ошибка.",
+            show_alert=True
+        )
+
+        return
+
+    game = games.get(
+        message_id
+    )
+
+    if not game:
+
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            pass
+
+        await callback.answer(
+            "Удалено."
+        )
+
+        return
+
+    user_id = callback.from_user.id
+
+    allowed = (
+        user_id == game["creator_id"]
+        or await user_is_moderator(
+            game["chat_id"],
+            user_id
+        )
+    )
+
+    if not allowed:
+
+        await callback.answer(
+            "Удалить игру может создатель или модератор.",
+            show_alert=True
+        )
+
+        return
+
+    await delete_game_message(
+        game["chat_id"],
+        message_id
+    )
+
+    await callback.answer(
+        "Игра удалена."
+    )
+
+
+# ============================================================
+# 💧 КАПЛЯ
+# ============================================================
+
+SEASONS = [
+    "🌱 Весна",
+    "☀️ Лето",
+    "🍂 Осень",
+    "❄️ Зима"
+]
+
+WEATHERS = [
+    "☀️ солнечно",
+    "🌧 дождь",
+    "⛈ гроза",
+    "❄️ снег",
+    "🌬 ветер"
+]
+
+LOCATIONS = [
+    "🌳 Лес",
+    "🏡 Ферма",
+    "⛏ Шахта",
+    "🎣 Озеро",
+    "🏖 Пляж",
+    "🏘 Пеликан-Таун",
+    "🌲 Тайный лес"
+]
+
+CROPS = [
+    "🥔 картофель",
+    "🌶 острый перец",
+    "🍓 клубника",
+    "🎃 тыква",
+    "🌽 кукуруза",
+    "🍇 виноград",
+    "🍉 дыня"
+]
+
+ANIMALS = [
+    "🐔 курица",
+    "🐄 корова",
+    "🐐 коза",
+    "🐖 свинья",
+    "🐑 овца",
+    "🦆 утка"
+]
+
+MOODS = [
+    "😊 отличное настроение",
+    "😴 хочется спать",
+    "😎 настроение фермера",
+    "🤔 пора идти в шахту",
+    "🎣 хочется порыбачить",
+    "💰 время заработать"
+]
+
+
+def random_drop():
+
+    return (
+        "💧 <b>Капля дня</b>\n\n"
+        f"{random.choice(SEASONS)}\n"
+        f"{random.choice(WEATHERS)}\n"
+        f"{random.choice(LOCATIONS)}\n"
+        f"{random.choice(CROPS)}\n"
+        f"{random.choice(ANIMALS)}\n"
+        f"{random.choice(MOODS)}\n\n"
+        "✨ Каждый раз получается новый набор."
+    )
+
+
+def drop_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💧 Новая капля",
+                    callback_data="random_drop"
+                )
+            ]
+        ]
+    )
+
+
+@dp.callback_query(
+    F.data == "random_drop"
+)
+async def random_drop_callback(
+    callback: CallbackQuery
+):
+
+    await callback.message.edit_text(
+        random_drop(),
+        reply_markup=drop_keyboard()
+    )
+
+    await callback.answer(
+        "Новый набор!"
+    )
+
+
+@dp.message(
+    Command("drop"),
+    F.chat.type.in_({
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    })
+)
+async def drop_command(
+    message: Message
+):
+
+    await message.answer(
+        random_drop(),
+        reply_markup=drop_keyboard()
+    )
+
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+
+# ============================================================
+# АДМИН-КОМАНДА /ID
+# ============================================================
+
+@dp.message(
+    Command("id"),
+    F.chat.type.in_({
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    })
+)
+async def id_command(
+    message: Message
+):
+
+    await message.answer(
+        f"🆔 ID чата:\n<code>{message.chat.id}</code>"
+    )
+
+
+# ============================================================
+# ЗАПУСК
+# ============================================================
+
+async def main():
+
+    me = await bot.get_me()
+
+    logger.info(
+        "Бот запущен: @%s",
+        me.username
+    )
+
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types()
+    )
+
+
+if __name__ == "__main__":
+
+    try:
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен.")
